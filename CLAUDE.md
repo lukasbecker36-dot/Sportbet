@@ -21,40 +21,74 @@ All dependencies tracked in `requirements.txt`.
 ## Project Structure
 
 ```
-project/
-├── config.py                  # API keys, thresholds, league IDs — in .gitignore
-├── data/
-│   ├── raw_json/              # Cached raw FotMob API responses
-│   ├── betfair_historical/    # Downloaded Betfair historical price files
-│   └── db/xg_signals.db      # Main SQLite database
-├── scrapers/
-│   ├── fotmob.py              # FotMob API wrapper
-│   └── betfair_historical.py # Betfair historical file parser
-├── pipeline/
-│   ├── ingest.py              # Orchestrates scraping → DB writes
-│   ├── signals.py             # xG signal detection logic
-│   ├── backtest.py            # Backtesting engine / grid search
-│   └── ev_analysis.py        # EV calculation and results output
-├── live/
-│   ├── monitor.py             # Live match polling loop (Phase 2)
-│   └── alerts.py              # Telegram notification sender (Phase 2)
-├── results/                   # Output CSVs and charts from backtest
-└── notebooks/exploration.ipynb
+config.example.py             # template; copy to config.py (gitignored) before running
+config.py                     # API keys, thresholds, league/season config — in .gitignore
+run.py                        # CLI entrypoint (init-db | ingest | signals | backtest | ev | all)
+db/
+  schema.sql                  # matches / shots / signals tables + indexes
+  connection.py               # get_conn(), init_db()
+scrapers/
+  fotmob.py                   # FotMob API wrapper: session+headers, cached GET, league/match, parse_match
+  betfair_historical.py       # bz2-CSV parser, over-goals price extraction, net_odds()
+pipeline/
+  ingest.py                   # FotMob -> matches + shots tables (idempotent; uses raw_json cache)
+  signals.py                  # minute-by-minute feature frame; crossing-event detection -> signals table
+  backtest.py                 # grid search over thresholds/windows/markets -> results/signal_ev_table.csv
+  ev_analysis.py              # attach Betfair odds (if files present), EV calc, best_signals + equity curve
+utils/
+  logging.py                  # get_logger() -> scrape.log + console
+  teams.py                    # normalise() / canonical() for FotMob<->Betfair name matching
+live/                         # Phase 2 (not yet built): monitor.py, alerts.py
+data/raw_json/                # cached raw FotMob responses (gitignored)
+data/betfair_historical/      # drop downloaded Betfair price files here (gitignored)
+data/db/xg_signals.db         # main SQLite db (gitignored)
+results/                      # signal_ev_table.csv, best_signals.csv, equity_curve.png (gitignored)
+notebooks/exploration.ipynb   # EDA stub
+tests/                        # pytest: shotmap parse, signals, betfair parse
 ```
 
-## Development Order
+## Commands
 
-Build and test strictly in this sequence — don't skip ahead:
+```bash
+pip install -r requirements.txt
+cp config.example.py config.py        # then edit league/season scope as needed
 
-1. `scrapers/fotmob.py` — fetch one match, parse shotmap, print to console
-2. DB setup — create schema, insert that one match
-3. `pipeline/ingest.py` — loop over all matches for one league/season
-4. `pipeline/signals.py` — compute minute-by-minute features for all matches
-5. `pipeline/backtest.py` — grid search across signal thresholds
-6. Betfair data — parse one historical file, join to a match
-7. `pipeline/ev_analysis.py` — full EV calculation with real Betfair odds
-8. `live/monitor.py` — live polling loop (only after step 7 confirms edge)
-9. `live/alerts.py` — Telegram notifications
+python run.py init-db                 # create the SQLite schema
+python run.py ingest                  # scrape FotMob -> matches + shots (respects raw_json cache)
+python run.py signals                 # compute xG signals -> signals table
+python run.py backtest                # grid search -> results/signal_ev_table.csv
+python run.py ev                       # attach Betfair odds (if any) + write best_signals / equity curve
+python run.py all                     # init-db -> ingest -> signals -> backtest -> ev
+
+pytest -q                             # run all tests
+pytest tests/test_signals.py::test_xg_rate_window_values   # run one test
+```
+
+## Current State (Phase 1: backtest pipeline, steps 1–7)
+
+Steps 1–7 are implemented. The `live/` package (steps 8–9) is intentionally not built yet — per the
+brief, build it only after a backtest confirms a positive-EV signal.
+
+**Known limitation:** FotMob's API requires browser-like requests; if you hit persistent `403`s, the
+host is being blocked (network egress / anti-bot). The scraper handles 429/403 with a 60s backoff +
+one retry, then raises. The rest of the pipeline (`signals` → `backtest` → `ev`) runs entirely on the
+local SQLite DB and is independent of network access.
+
+**No Betfair files yet:** `python run.py ev` runs in "no-odds mode" — it re-emits the win-rate table
+and prints a note. Drop `.bz2`/`.csv` price files into `data/betfair_historical/` and re-run `ev` to
+populate the `signals.betfair_*_odds` columns and get real EV / profit / sharpe figures.
+
+## Development Order (from the brief)
+
+1. `scrapers/fotmob.py` — fetch one match, parse shotmap, print to console *(done)*
+2. DB setup — `db/schema.sql` + `db/connection.py` *(done)*
+3. `pipeline/ingest.py` — loop over matches for a league/season *(done)*
+4. `pipeline/signals.py` — minute-by-minute features for all matches *(done)*
+5. `pipeline/backtest.py` — grid search across signal thresholds *(done)*
+6. Betfair data — `scrapers/betfair_historical.py` parser *(done)*
+7. `pipeline/ev_analysis.py` — EV calculation with Betfair odds *(done; odds path runs once files exist)*
+8. `live/monitor.py` — live polling loop *(not started)*
+9. `live/alerts.py` — Telegram notifications *(not started)*
 
 ## FotMob API
 
@@ -257,3 +291,21 @@ TEAM_NAME_MAP = {}  # populated as FotMob↔Betfair mismatches are found
 - Some matches have no shotmap (cup games, lower leagues) — skip gracefully.
 - Live phase (`live/`) is Phase 2: build only after backtest confirms a positive-EV signal. Do NOT auto-place bets in v1 — alerts only.
 - Kelly criterion stake sizing is used in alert messages, not for automated placement.
+
+## Implementation Decisions (read before changing signals/backtest)
+
+- **Signal = crossing event.** `signals.detect_signals` emits one row per match at the minute the
+  `xg_rate_15m` series transitions from below `min(XG_RATE_THRESHOLDS)` to at-or-above it (within
+  `[min(MIN_MINUTE), max(MAX_MINUTE)]`). At most a few rows per match → roughly independent samples.
+  The backtest re-applies higher thresholds and tighter minute windows by filtering on the stored
+  `signal_value` / `trigger_minute` — so the `signals` table stays small and the grid search is a
+  pure pandas filter.
+- **Over-line win modelling.** A trigger at minute `m` with `G` goals already scored is evaluated
+  **only** against the `over-(G+0.5)` line (the live-relevant case); other markets are skipped for
+  that trigger. It "wins" if ≥1 more goal is scored within `DEFAULT_GOAL_WINDOW` minutes of `m`
+  (`signals.next_goal_within_<W>`), or trivially if the line was already cleared.
+- **Odds adjustment.** `net_odds = (odds-1)*(1-BETFAIR_COMMISSION)+1`, then a conservative haircut on
+  the edge: `adjusted = 1 + (net_odds-1)*ODDS_HAIRCUT`. EV/profit/sharpe use `adjusted`.
+- **Betfair odds path is scaffold.** Without price files, `ev_analysis` runs in no-odds mode. With
+  files, event↔match alignment is best-effort (team-name match on `(home, away, date)`; a mid-match
+  price snapshot proxies the trigger-minute price). Validate against real files before trusting EV.
