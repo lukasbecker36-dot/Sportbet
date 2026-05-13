@@ -55,16 +55,19 @@ def _parse_dt(value) -> datetime | None:
 
 
 # --------------------------------------------------------------------------- #
-# Betfair -> signals odds writeback
+# Betfair -> signals odds writeback (per-signal, time-accurate)
 # --------------------------------------------------------------------------- #
+_PRICE_MIN, _PRICE_MAX = 1.01, 100.0
+
+
 def _load_matches(conn) -> pd.DataFrame:
     return pd.read_sql_query(
         "SELECT match_id, date, home_team, away_team FROM matches", conn
     )
 
 
-def _build_event_index(conn) -> dict:
-    """(canon_home, canon_away, date) -> match_id."""
+def _build_event_index(conn) -> dict[tuple, str]:
+    """(canon_home, canon_away, YYYY-MM-DD) -> match_id."""
     matches = _load_matches(conn)
     index: dict[tuple, str] = {}
     for _, m in matches.iterrows():
@@ -72,59 +75,120 @@ def _build_event_index(conn) -> dict:
         day = dt.date().isoformat() if dt else None
         key = (canonical(str(m["home_team"] or "")), canonical(str(m["away_team"] or "")), day)
         index[key] = m["match_id"]
-    return index, {m["match_id"]: _parse_dt(m["date"]) for _, m in matches.iterrows()}
+    return index
+
+
+def _match_minute_to_offset(minute: int) -> timedelta:
+    """Wall-clock elapsed since kickoff for a given *match* minute.
+
+    Adds a ~15-minute lump for the half-time break once past minute 45.
+    """
+    minute = max(int(minute), 0)
+    extra = 15 if minute > 45 else 0
+    return timedelta(minutes=minute + extra)
+
+
+def _price_at(series: list[tuple], target: datetime) -> float | None:
+    """Last in-range traded price at-or-before ``target`` (series is time-sorted)."""
+    chosen = None
+    for ts, price in series:
+        if ts is None:
+            continue
+        if ts > target:
+            break
+        if _PRICE_MIN <= price <= _PRICE_MAX:
+            chosen = price
+    if chosen is None:  # nothing valid before kickoff+offset — fall back to first valid
+        for ts, price in series:
+            if _PRICE_MIN <= price <= _PRICE_MAX:
+                return price
+    return chosen
 
 
 def attach_betfair_odds(conn) -> int:
     files = bf.list_files()
     if not files:
         return 0
-    event_index, kickoff_by_match = _build_event_index(conn)
+    # Recompute from scratch every run — clear any previously written odds.
+    conn.execute(
+        "UPDATE signals SET betfair_over05_odds = NULL, betfair_over15_odds = NULL, "
+        "betfair_over25_odds = NULL, betfair_over35_odds = NULL"
+    )
+    event_index = _build_event_index(conn)
 
-    # match_id -> {odds_col -> chosen price}
-    chosen: dict[str, dict[str, float]] = {}
+    # match_id -> {line -> [(ts, price), ...]}  and  match_id -> kickoff datetime
+    series_by_match: dict[str, dict[float, list[tuple]]] = {}
+    kickoff_by_match: dict[str, datetime] = {}
+
     for filepath in files:
-        rows = bf.extract_over_goals_prices(filepath)
-        # Group by (home, away, line)
-        grouped: dict[tuple, list[dict]] = {}
-        for r in rows:
-            if not r["home"] or not r["away"] or r["last_price_traded"] is None:
-                continue
-            grouped.setdefault((r["home"], r["away"], r["line"]), []).append(r)
-        for (home, away, line), snaps in grouped.items():
-            # Try to find the FotMob match: look across any date that matches names.
-            match_id = None
-            for (h, a, _day), mid in event_index.items():
-                if h == home and a == away:
-                    match_id = mid
-                    break
-            if match_id is None:
-                continue
-            odds_col = bf.LINE_TO_ODDS_COL.get(line)
-            if not odds_col:
-                continue
-            # Pick the price ~ at the median in-play timestamp (proxy for "mid-match").
-            timed = sorted(
-                ((_parse_dt(s["market_time"]), s["last_price_traded"]) for s in snaps if _parse_dt(s["market_time"])),
-            )
-            if timed:
-                price = timed[len(timed) // 2][1]
-            else:
-                price = snaps[len(snaps) // 2]["last_price_traded"]
-            chosen.setdefault(match_id, {})[odds_col] = float(price)
+        market = bf.parse_market(filepath)
+        if not market or not market["home"] or not market["away"]:
+            continue
+        kickoff = _parse_dt(market["kickoff"])
+        snaps = [(_parse_dt(ts), p) for ts, p in market["snapshots"]]
+        snaps = [(ts, p) for ts, p in snaps if ts is not None]
+        if not snaps:
+            continue
+        snaps.sort(key=lambda t: t[0])
+        if kickoff is None:
+            kickoff = snaps[0][0]
 
-    if not chosen:
+        # Match on (home, away, day) with a +/- 1 day tolerance (UTC vs local).
+        match_id = None
+        for delta in (0, -1, 1):
+            day = (kickoff + timedelta(days=delta)).date().isoformat()
+            mid = event_index.get((market["home"], market["away"], day))
+            if mid:
+                match_id = mid
+                break
+        if match_id is None:
+            continue
+
+        line = market["line"]
+        series_by_match.setdefault(match_id, {}).setdefault(line, []).extend(snaps)
+        # Prefer the first kickoff we see for a match (markets agree on it anyway).
+        kickoff_by_match.setdefault(match_id, kickoff)
+
+    if not series_by_match:
         logger.warning("No Betfair events matched any FotMob match.")
         return 0
 
+    for by_line in series_by_match.values():
+        for series in by_line.values():
+            series.sort(key=lambda t: t[0])
+
+    signals = pd.read_sql_query(
+        "SELECT id, match_id, trigger_minute FROM signals", conn
+    )
     updated = 0
-    for match_id, cols in chosen.items():
+    matched_signal_matches: set[str] = set()
+    for _, sig in signals.iterrows():
+        match_id = sig["match_id"]
+        by_line = series_by_match.get(match_id)
+        if not by_line:
+            continue
+        kickoff = kickoff_by_match[match_id]
+        target = kickoff + _match_minute_to_offset(sig["trigger_minute"])
+        cols: dict[str, float] = {}
+        for line, series in by_line.items():
+            odds_col = bf.LINE_TO_ODDS_COL.get(line)
+            if not odds_col:
+                continue
+            price = _price_at(series, target)
+            if price is not None:
+                cols[odds_col] = float(price)
+        if not cols:
+            continue
         set_clause = ", ".join(f"{c} = ?" for c in cols)
-        params = list(cols.values()) + [match_id]
-        cur = conn.execute(f"UPDATE signals SET {set_clause} WHERE match_id = ?", params)
-        updated += cur.rowcount
+        params = list(cols.values()) + [int(sig["id"])]
+        conn.execute(f"UPDATE signals SET {set_clause} WHERE id = ?", params)
+        updated += 1
+        matched_signal_matches.add(match_id)
     conn.commit()
-    logger.info("Attached Betfair odds to %d signal rows across %d matches", updated, len(chosen))
+    logger.info(
+        "Attached time-accurate Betfair odds to %d signal rows across %d matches",
+        updated, len(matched_signal_matches),
+    )
     return updated
 
 

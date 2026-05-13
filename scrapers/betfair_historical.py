@@ -1,14 +1,19 @@
-"""Parser for Betfair historical price files (streaming JSON, bz2-compressed).
+"""Parser for Betfair historical price files.
 
 Source: https://historicdata.betfair.com/  (free Betfair account required).
 Drop downloaded files into config.BETFAIR_DATA_DIR (nested subdirectories OK).
 
-Each .bz2 file is one market in Betfair's streaming format:
-  line 1  -> {"op":"mcm","mc":[{"id":"...","marketDefinition":{...}}]}
-  line N  -> {"op":"mcm","pt":<ms>,"mc":[{"id":"...","rc":[{"id":<rid>,"ltp":<price>}]}]}
+Two on-disk formats are supported transparently:
+
+  * Streaming JSON (the "BASIC"/"PRO" exports): one bz2 file per market, newline-
+    delimited JSON ("mcm" messages) — first message carries the marketDefinition,
+    later ones carry runner-change price updates with millisecond timestamps.
+  * Legacy CSV exports: one row per price snapshot with EVENT_NAME / MARKET_NAME /
+    SELECTION_NAME / MARKET_TIME / LAST_PRICE_TRADED / MATCHED_AMOUNT columns.
 """
 
 import bz2
+import csv
 import json
 import os
 import re
@@ -21,6 +26,7 @@ from utils.teams import normalise
 
 logger = get_logger("betfair")
 
+_OVER_SELECTION_RE = re.compile(r"^Over\s+(\d+\.\d)\s+Goals$", re.IGNORECASE)
 _EVENT_VS_RE = re.compile(r"\s+v\s+|\s+vs\.?\s+", re.IGNORECASE)
 
 _MARKET_TYPE_TO_LINE = {
@@ -57,6 +63,12 @@ def list_files(directory: str | None = None) -> list[str]:
     return sorted(found)
 
 
+def _open_text(filepath: str):
+    if filepath.endswith(".bz2"):
+        return bz2.open(filepath, "rt", newline="")
+    return open(filepath, "rt", newline="")
+
+
 def _parse_event_teams(event_name: str | None) -> tuple[str, str] | None:
     if not event_name:
         return None
@@ -66,80 +78,151 @@ def _parse_event_teams(event_name: str | None) -> tuple[str, str] | None:
     return normalise(parts[0]), normalise(parts[1])
 
 
-def extract_over_goals_prices(filepath: str) -> list[dict]:
-    """Return Over-N.5-Goals price snapshots from one streaming-JSON bz2 file.
+def _iso_from_pt(pt) -> str | None:
+    if pt is None:
+        return None
+    return datetime.fromtimestamp(float(pt) / 1000.0, tz=timezone.utc).isoformat()
 
-    Each record: {line, market_time, last_price_traded, matched_amount,
-                  home, away, event_name}
+
+# --------------------------------------------------------------------------- #
+# Streaming-JSON format
+# --------------------------------------------------------------------------- #
+def parse_market(filepath: str) -> dict | None:
+    """Parse one streaming-JSON market file into structured form.
+
+    Returns None if the file isn't a recognised over-goals market.
+    Otherwise:
+        {home, away, line, kickoff, event_name,
+         snapshots: [(timestamp_iso, last_traded_price), ...]}   # time-ordered
+    where ``kickoff`` is the scheduled market start (ISO str) or None.
     """
-    out: list[dict] = []
     try:
-        with bz2.open(filepath, "rt") as fh:
+        with _open_text(filepath) as fh:
             raw_lines = [ln.strip() for ln in fh if ln.strip()]
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning("Cannot open %s: %s", filepath, exc)
-        return []
-
+        return None
     if not raw_lines:
-        return []
+        return None
 
-    # --- Parse market definition from first message ---
     try:
         first_msg = json.loads(raw_lines[0])
     except json.JSONDecodeError:
-        logger.warning("Bad JSON in first line of %s", filepath)
-        return []
+        return None  # not streaming JSON
 
     mc_list = first_msg.get("mc", [])
     if not mc_list:
-        return []
+        return None
     md = mc_list[0].get("marketDefinition", {})
 
-    market_type = md.get("marketType", "")
-    line = _MARKET_TYPE_TO_LINE.get(market_type)
+    line = _MARKET_TYPE_TO_LINE.get(md.get("marketType", ""))
     if line is None:
-        return []  # not an over-goals market we care about
-
-    event_name = md.get("eventName", "")
-    teams = _parse_event_teams(event_name)
+        return None
+    teams = _parse_event_teams(md.get("eventName", ""))
     if not teams:
-        return []
+        return None
     home, away = teams
 
-    # Find the runner ID for "Over X Goals" (not "Under")
-    over_runner_id: int | None = None
+    over_runner_id = None
     for runner in md.get("runners", []):
         if "over" in runner.get("name", "").lower():
             over_runner_id = runner.get("id")
             break
     if over_runner_id is None:
-        return []
+        return None
 
-    # --- Parse subsequent price-update messages ---
-    for raw_line in raw_lines[1:]:
+    kickoff = md.get("marketTime") or md.get("openDate")
+
+    snapshots: list[tuple[str, float]] = []
+    # First message may itself carry rc entries; scan all messages uniformly.
+    for raw_line in raw_lines:
         try:
             msg = json.loads(raw_line)
         except json.JSONDecodeError:
             continue
-
-        pt = msg.get("pt")  # unix timestamp in milliseconds
-        mc_updates = msg.get("mc", [])
-        for market in mc_updates:
+        ts = _iso_from_pt(msg.get("pt"))
+        for market in msg.get("mc", []):
             for rc in market.get("rc", []):
-                if rc.get("id") == over_runner_id and "ltp" in rc:
-                    market_time = (
-                        datetime.fromtimestamp(pt / 1000.0, tz=timezone.utc).isoformat()
-                        if pt is not None else None
-                    )
-                    out.append({
-                        "line": line,
-                        "market_time": market_time,
-                        "last_price_traded": float(rc["ltp"]),
-                        "matched_amount": None,
-                        "home": home,
-                        "away": away,
-                        "event_name": event_name,
-                    })
+                if rc.get("id") == over_runner_id and "ltp" in rc and ts:
+                    snapshots.append((ts, float(rc["ltp"])))
+    snapshots.sort(key=lambda t: t[0])
 
+    return {
+        "home": home, "away": away, "line": line,
+        "kickoff": kickoff, "event_name": md.get("eventName", ""),
+        "snapshots": snapshots,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Legacy CSV format
+# --------------------------------------------------------------------------- #
+def iter_price_rows(filepath: str) -> Iterator[dict]:
+    with _open_text(filepath) as fh:
+        yield from csv.DictReader(fh)
+
+
+def _extract_csv(filepath: str) -> list[dict]:
+    out: list[dict] = []
+    for row in iter_price_rows(filepath):
+        selection = (row.get("SELECTION_NAME") or "").strip()
+        m = _OVER_SELECTION_RE.match(selection)
+        if not m:
+            continue
+        line = float(m.group(1))
+        teams = _parse_event_teams(row.get("EVENT_NAME"))
+        try:
+            last_price = float(row["LAST_PRICE_TRADED"]) if row.get("LAST_PRICE_TRADED") else None
+        except ValueError:
+            last_price = None
+        try:
+            matched = float(row["MATCHED_AMOUNT"]) if row.get("MATCHED_AMOUNT") else None
+        except ValueError:
+            matched = None
+        out.append({
+            "line": line,
+            "market_time": row.get("MARKET_TIME"),
+            "last_price_traded": last_price,
+            "matched_amount": matched,
+            "home": teams[0] if teams else None,
+            "away": teams[1] if teams else None,
+            "event_name": row.get("EVENT_NAME"),
+        })
+    return out
+
+
+def _looks_like_json(filepath: str) -> bool:
+    try:
+        with _open_text(filepath) as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if ln:
+                    return ln.startswith("{")
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def extract_over_goals_prices(filepath: str) -> list[dict]:
+    """Flat list of Over-N.5-Goals price snapshots from one file (any format).
+
+    Each record: {line, market_time, last_price_traded, matched_amount,
+                  home, away, event_name}
+    """
+    if _looks_like_json(filepath):
+        market = parse_market(filepath)
+        if not market:
+            return []
+        out = [{
+            "line": market["line"],
+            "market_time": ts,
+            "last_price_traded": price,
+            "matched_amount": None,
+            "home": market["home"],
+            "away": market["away"],
+            "event_name": market["event_name"],
+        } for ts, price in market["snapshots"]]
+    else:
+        out = _extract_csv(filepath)
     logger.info("Parsed %d over-goals price rows from %s", len(out), os.path.basename(filepath))
     return out
