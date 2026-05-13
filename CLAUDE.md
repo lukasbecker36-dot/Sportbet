@@ -302,10 +302,15 @@ TEAM_NAME_MAP = {}  # populated as FotMob↔Betfair mismatches are found
   pure pandas filter.
 - **Over-line win modelling.** A trigger at minute `m` with `G` goals already scored is evaluated
   **only** against the `over-(G+0.5)` line (the live-relevant case); other markets are skipped for
-  that trigger. It "wins" if ≥1 more goal is scored within `DEFAULT_GOAL_WINDOW` minutes of `m`
-  (`signals.next_goal_within_<W>`), or trivially if the line was already cleared.
+  that trigger. It "wins" if the match's **final total** exceeds that line (≥1 more goal before full
+  time) — i.e. how a Betfair over-goals back bet settles if held to FT. The
+  `signals.next_goal_within_<W>` columns are still recorded for ad-hoc short-window analysis but the
+  backtest no longer uses them.
 - **Odds adjustment.** `net_odds = (odds-1)*(1-BETFAIR_COMMISSION)+1`, then a conservative haircut on
   the edge: `adjusted = 1 + (net_odds-1)*ODDS_HAIRCUT`. EV/profit/sharpe use `adjusted`.
-- **Betfair odds path is scaffold.** Without price files, `ev_analysis` runs in no-odds mode. With
-  files, event↔match alignment is best-effort (team-name match on `(home, away, date)`; a mid-match
-  price snapshot proxies the trigger-minute price). Validate against real files before trusting EV.
+- **Betfair odds path.** Without price files, `ev_analysis` runs in no-odds mode. With files,
+  `attach_betfair_odds` parses each market (streaming-JSON or legacy-CSV), matches events to FotMob
+  matches on `(home, away, date)`, and writes the **last traded price at the wall-clock time of each
+  signal's trigger minute** (kickoff + minute, +15 min once past HT) into that signal's row. Odds
+  columns are cleared and recomputed every `ev` run. Sample size is whatever the price files cover —
+  validate before trusting EV.

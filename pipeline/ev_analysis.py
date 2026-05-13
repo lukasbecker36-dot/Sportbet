@@ -236,7 +236,7 @@ def _equity_curve(conn, best: pd.DataFrame) -> None:
         sel = sel[sel[odds_col].notna()]
         if sel.empty:
             continue
-        wins = _win_series(sel, line, config.DEFAULT_GOAL_WINDOW)
+        wins = _win_series(sel, line)
         adj = _adjusted_odds(sel[odds_col]).to_numpy()
         profit = (wins.to_numpy() * adj - 1.0)
         ax.plot(range(1, len(profit) + 1), profit.cumsum(),
