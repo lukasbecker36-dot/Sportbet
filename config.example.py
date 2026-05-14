@@ -57,3 +57,61 @@ ODDS_HAIRCUT = 0.92  # multiply decimal-odds edge by this to be conservative
 # Candidate-strategy filters for results/best_signals.csv
 MIN_EV = 0.05
 MIN_TRIGGERS = 50
+
+# --- Live phase (live/ package) ---
+# Strategy defaults — used when SofaScore tournament id doesn't match any
+# league-specific entry below. These mirror the OOS-robust pick for PL.
+LIVE_XG_THRESHOLD = 0.20
+LIVE_MARKET_LINE = 2.5
+LIVE_MIN_MINUTE = 30
+LIVE_MAX_MINUTE = 85
+LIVE_BASE_WIN_RATE = 0.57
+
+# Auto-discovery: when True the runner polls SofaScore for live + upcoming
+# matches in any league in LIVE_STRATEGY_BY_LEAGUE and starts a monitor for
+# each. You can still /watch <event_id> manually for matches outside this set.
+LIVE_AUTO_DISCOVER = True
+LIVE_AUTO_DISCOVER_INTERVAL_S = 60      # how often to scan
+LIVE_AUTO_DISCOVER_LOOKAHEAD_H = 3      # also watch fixtures starting in next N hours
+
+# Per-league overrides — keyed by SofaScore uniqueTournament id.
+# Each tuple holds the robust strategy from the 24/25 + 25/26 holdout
+# (results/per_league_best.csv) with the *averaged* win-rate used for EV.
+#
+#   (threshold, market_line, min_minute, max_minute, win_rate)
+#
+# Source: backtest min(EV across both seasons) ≥ 0.05 with n_priced ≥ 30/season.
+LIVE_STRATEGY_BY_LEAGUE: dict[int, tuple] = {
+    17: (0.20, 2.5, 55, 85, 0.572),  # ENG-Premier League
+    8:  (0.30, 1.5, 55, 80, 0.590),  # ESP-La Liga
+    23: (0.25, 3.5, 30, 85, 0.505),  # ITA-Serie A
+    35: (0.20, 2.5, 30, 75, 0.783),  # GER-Bundesliga
+    34: (0.50, 1.5, 30, 80, 0.755),  # FRA-Ligue 1
+}
+
+# EV gating: only fire the Telegram alert if both (a) the xG threshold is met
+# AND (b) Betfair live odds give EV >= this floor after commission + haircut.
+LIVE_MIN_EV = 0.10
+
+# Bet placement caps (defence in depth).
+LIVE_STAKE_GBP = 10.0           # flat per trade
+LIVE_MAX_STAKE_GBP = 10.0       # hard cap; placement aborts if exceeded
+LIVE_DAILY_STAKE_CAP_GBP = 30.0 # rough 3-trade-per-day ceiling
+LIVE_CONFIRM_TIMEOUT_S = 60     # manual mode: seconds before alert expires
+LIVE_POLL_SECONDS = 30
+
+# Auto-place behaviour:
+#   "manual"         — Telegram message with [Place £10] / [Skip] buttons.
+#                      Nothing happens until you tap. Expires after
+#                      LIVE_CONFIRM_TIMEOUT_S.
+#   "cancel_window"  — Telegram message with [✖ CANCEL] only. After
+#                      LIVE_AUTO_CANCEL_WINDOW_S seconds with no tap, the bet
+#                      places automatically (re-priced EV recheck still runs).
+#   "full_auto"      — Place immediately on signal. Telegram receives a
+#                      result-only message. /kill is the only abort.
+LIVE_AUTO_PLACE_MODE = "cancel_window"
+LIVE_AUTO_CANCEL_WINDOW_S = 15
+
+# Path of a file that, when present, disables ALL bet placement (alerts still
+# fire). Touch this file as an emergency kill switch.
+LIVE_KILL_SWITCH_FILE = "KILL"

@@ -1,0 +1,26 @@
+[Unit]
+Description=Sportbet live xG/odds monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sportbet
+Group=sportbet
+WorkingDirectory=/home/sportbet/Sportbet
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/sportbet/Sportbet/.venv/bin/python -m live.runner
+Restart=always
+RestartSec=10s
+
+# Modest hardening — fine for a single-purpose VM.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+# Log to systemd-journald; view with: journalctl -u sportbet -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
