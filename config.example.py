@@ -135,6 +135,11 @@ LIVE_DAILY_STAKE_CAP_GBP = 60.0 # 6 x £10 trades across all matches/strategies
 LIVE_CONFIRM_TIMEOUT_S = 60     # manual mode: seconds before alert expires
 LIVE_POLL_SECONDS = 30
 
+# Hypothetical paper-trade stake used by the /pnl Telegram command.
+# Independent of LIVE_STAKE_GBP (which is the real placement stake) — this
+# is just "what would my running P&L be if I'd put £X on every signal?".
+PAPER_STAKE_GBP = 5.0
+
 # Auto-place behaviour:
 #   "manual"         — Telegram message with [Place £10] / [Skip] buttons.
 #                      Nothing happens until you tap. Expires after

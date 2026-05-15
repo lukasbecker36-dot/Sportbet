@@ -189,7 +189,8 @@ _HELP_TEXT = (
     "<b>Sportbet live monitor — commands</b>\n"
     "/help — show this list\n"
     "/status — list matches currently being watched\n"
-    "/recent — last 10 fired signals (across all matches)\n"
+    "/pnl — paper P&L if you'd flat-staked every signal\n"
+    "/recent — last 10 fired signals with ✅/❌/⏳ markers\n"
     "/xg <code>&lt;event_id&gt;</code> — current xG rate + score for a live match\n"
     "/watch <code>&lt;event_id&gt;</code> — manually add a match (auto-discovery covers Big 5)\n"
     "/stop <code>[event_id]</code> — stop one monitor (or all if no id)\n"
@@ -213,6 +214,12 @@ async def _cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(_HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
+def _outcome_marker(a: dict) -> str:
+    if not a.get("settled"):
+        return "⏳"  # pending
+    return "✅" if a.get("won") else "❌"
+
+
 async def _cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorised(update):
         return
@@ -223,14 +230,47 @@ async def _cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["<b>Recent signals</b> (newest first):"]
     for a in alerts[:10]:
         ts = a["ts"].replace("T", " ").replace("+00:00", "Z")
+        marker = _outcome_marker(a)
+        tail = ""
+        if a.get("settled"):
+            ft = a.get("final_total")
+            pp = a.get("paper_profit_gbp")
+            tail = f"  FT total={ft}  paper £{pp:+.2f}"
         lines.append(
-            f"• {ts}  {a['home']} v {a['away']}\n"
+            f"{marker} {ts}  {a['home']} v {a['away']}\n"
             f"   min {a['minute']}'  score {a['score']}  "
             f"xG15 <b>{a['xg_rate']:.2f}</b>  "
             f"{a['market']}@<b>{a['price']:.2f}</b>  "
-            f"EV <b>{a['ev']:+.2f}</b>  ({a['mode']})"
+            f"EV <b>{a['ev']:+.2f}</b>{tail}"
         )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def _cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorised(update):
+        return
+    alerts = list(ctx.application.bot_data.get("recent_alerts") or [])
+    settled = [a for a in alerts if a.get("settled")]
+    pending = [a for a in alerts if not a.get("settled")]
+    if not settled and not pending:
+        await update.message.reply_text("No signals tracked yet.")
+        return
+    stake = float(getattr(config, "PAPER_STAKE_GBP", 5.0))
+    total_pnl = sum((a.get("paper_profit_gbp") or 0) for a in settled)
+    wins = sum(1 for a in settled if a.get("won"))
+    losses = sum(1 for a in settled if a.get("settled") and not a.get("won"))
+    n = wins + losses
+    win_rate = (wins / n * 100) if n else 0.0
+    total_staked = stake * n
+    roi = (total_pnl / total_staked * 100) if total_staked else 0.0
+    msg = (
+        f"<b>📊 Paper P&L</b>  (£{stake:g}/signal)\n"
+        f"settled: <b>{n}</b>  ({wins}W / {losses}L  ·  win rate {win_rate:.1f}%)\n"
+        f"pending: <b>{len(pending)}</b>\n"
+        f"running P&L: <b>£{total_pnl:+.2f}</b>  on £{total_staked:.0f} staked  "
+        f"({roi:+.1f}% ROI)"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
 async def _cmd_xg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -424,6 +464,7 @@ async def build_application(
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("help", _cmd_help))
     app.add_handler(CommandHandler("status", _cmd_status))
+    app.add_handler(CommandHandler("pnl", _cmd_pnl))
     app.add_handler(CommandHandler("recent", _cmd_recent))
     app.add_handler(CommandHandler("xg", _cmd_xg))
     app.add_handler(CommandHandler("funds", _cmd_funds))

@@ -40,7 +40,7 @@ import config
 from live import telegram_bot as tg
 from live.betfair_client import (
     BetfairLive, OverGoalsMarket, PriceSnapshot,
-    PlacementResult, expected_value,
+    PlacementResult, adjusted_odds, expected_value,
 )
 from live.monitor import (
     DEFAULT_MAX_MIN, DEFAULT_MIN_MIN, DEFAULT_THRESHOLD,
@@ -70,6 +70,33 @@ class RunnerState:
 
 
 STATE = RunnerState()
+
+
+def _settle_alerts_for_match(event_id: int, final_total: int) -> int:
+    """Settle every fired alert for this match against the final score.
+
+    Returns the number of alerts newly settled. P&L uses PAPER_STAKE_GBP — a
+    hypothetical flat stake — regardless of what (if anything) was actually
+    placed via Betfair.
+    """
+    stake = float(getattr(config, "PAPER_STAKE_GBP", 5.0))
+    n = 0
+    for a in STATE.recent_alerts:
+        if a.get("event_id") != event_id or a.get("settled"):
+            continue
+        line = a.get("market_line")
+        price = a.get("price")
+        if line is None or price is None:
+            continue
+        won = final_total > float(line)
+        adj = adjusted_odds(float(price))
+        profit = stake * (adj - 1.0) if won else -stake
+        a["settled"] = True
+        a["won"] = bool(won)
+        a["final_total"] = int(final_total)
+        a["paper_profit_gbp"] = round(float(profit), 2)
+        n += 1
+    return n
 
 
 def _strategies_for(tournament_id: int | None) -> list[tuple]:
@@ -212,12 +239,35 @@ async def _monitor_match(event_id: int) -> None:
 
             if status_type in {"finished", "postponed", "canceled"}:
                 fire_count = len(fired)
+                # Settle any fired alerts against the final score.
+                fh = (ev.get("homeScore", {}) or {}).get("current")
+                fa = (ev.get("awayScore", {}) or {}).get("current")
+                settled_msg = ""
+                if status_type == "finished" and fh is not None and fa is not None:
+                    final_total = int(fh) + int(fa)
+                    settled = _settle_alerts_for_match(event_id, final_total)
+                    if settled:
+                        # Summarise settled outcomes for this match.
+                        wons = [a for a in STATE.recent_alerts
+                                if a.get("event_id") == event_id and a.get("won")]
+                        loses = [a for a in STATE.recent_alerts
+                                 if a.get("event_id") == event_id
+                                 and a.get("settled") and not a.get("won")]
+                        net = sum((a.get("paper_profit_gbp") or 0)
+                                  for a in STATE.recent_alerts
+                                  if a.get("event_id") == event_id and a.get("settled"))
+                        settled_msg = (
+                            f"\nfinal {fh}-{fa}  ·  "
+                            f"{len(wons)}W / {len(loses)}L  ·  "
+                            f"paper P&L £{net:+.2f}"
+                        )
                 tail = (
-                    f"{fire_count} bet{'s' if fire_count != 1 else ''} placed."
+                    f"{fire_count} signal{'s' if fire_count != 1 else ''} fired."
                     if fire_count else "No signal fired."
                 )
                 await handle.send_text(
-                    f"🏁 <b>{home} v {away}</b> — {status_desc}. {tail}",
+                    f"🏁 <b>{home} v {away}</b> — {status_desc}. {tail}"
+                    + settled_msg,
                 )
                 return
 
@@ -361,8 +411,12 @@ async def _push_alert(
         "minute": minute, "score": score,
         "xg_rate": rate,
         "market": f"over_{effective_line}",
+        "market_line": effective_line,
         "price": price, "ev": ev_value,
         "mode": mode,
+        # Filled in by _settle_alerts_for_match when the match finishes.
+        "settled": False, "won": None, "final_total": None,
+        "paper_profit_gbp": None,
     })
 
     if mode == "full_auto":
