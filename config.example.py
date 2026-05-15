@@ -15,6 +15,12 @@ BETFAIR_CERTS_PATH = ""
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
 
+# Optional residential proxy for SofaScore traffic ONLY. Required when running
+# on a datacenter IP (Hetzner/AWS/DigitalOcean) since Cloudflare 403s those
+# IP ranges for SofaScore. Format: "http://user:pass@host:port".
+# Betfair + Telegram continue to go direct — do NOT proxy those.
+SOFASCORE_HTTP_PROXY = ""
+
 # --- Scraping ---
 SCRAPE_DELAY_MIN = 2.0
 SCRAPE_DELAY_MAX = 3.0

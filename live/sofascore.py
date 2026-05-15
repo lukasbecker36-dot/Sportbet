@@ -24,6 +24,8 @@ from typing import Iterable, Iterator
 
 from curl_cffi.requests import Session
 
+import config
+
 PL_UNIQUE_TOURNAMENT_ID = 17
 BASE = "https://api.sofascore.com/api/v1"
 _HEADERS = {
@@ -45,7 +47,12 @@ class SofaScore:
     """TLS-spoofed wrapper around SofaScore's public JSON endpoints."""
 
     def __init__(self, *, impersonate: str = _IMPERSONATE) -> None:
-        self._client = Session(impersonate=impersonate)
+        # Cloudflare blocks SofaScore from datacenter IPs (Hetzner, AWS, etc.).
+        # Route through a residential proxy when SOFASCORE_HTTP_PROXY is set.
+        # Betfair + Telegram traffic do NOT go through this proxy.
+        proxy = (getattr(config, "SOFASCORE_HTTP_PROXY", "") or "").strip() or None
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        self._client = Session(impersonate=impersonate, proxies=proxies)
 
     def __enter__(self) -> "SofaScore":
         return self
