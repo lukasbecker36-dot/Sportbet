@@ -347,6 +347,7 @@ async def _monitor_match(event_id: int) -> None:
                     event_id, market, home, away,
                     minute, rate, score, price, ev_value,
                     market_line=target_line,
+                    league=tournament_name,
                 )
                 fired.add(i)
                 # Don't break — give other eligible strategies a chance on
