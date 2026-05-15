@@ -185,19 +185,32 @@ def _is_authorised(update: Update) -> bool:
     return str(chat.id) == str(config.TELEGRAM_CHAT_ID)
 
 
+_HELP_TEXT = (
+    "<b>Sportbet live monitor — commands</b>\n"
+    "/help — show this list\n"
+    "/status — list matches currently being watched\n"
+    "/recent — last 10 fired signals (across all matches)\n"
+    "/xg <code>&lt;event_id&gt;</code> — current xG rate + score for a live match\n"
+    "/watch <code>&lt;event_id&gt;</code> — manually add a match (auto-discovery covers Big 5)\n"
+    "/stop <code>[event_id]</code> — stop one monitor (or all if no id)\n"
+    "/funds — show Betfair balance (needs Account API perm on app key)\n"
+    "/kill — emergency: disable all bet placement (alerts still fire)\n"
+    "\n"
+    "Auto-discovery is on — PL / La Liga / Serie A / Bundesliga / Ligue 1 "
+    "matches get watched automatically within 3h of kickoff."
+)
+
+
 async def _cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorised(update):
         return
-    await update.message.reply_text(
-        "Sportbet live monitor connected.\n"
-        "/watch <event_id> — start watching a SofaScore match (multiple OK)\n"
-        "/status — list active monitors\n"
-        "/recent — last 10 fired signals (across all matches)\n"
-        "/xg <event_id> — current xg_rate_15m + score for a live match\n"
-        "/stop [event_id] — stop one monitor (or all if no id)\n"
-        "/funds — show Betfair balance (needs Account API perm)\n"
-        "/kill — emergency disable of all bet placement",
-    )
+    await update.message.reply_text(_HELP_TEXT, parse_mode=ParseMode.HTML)
+
+
+async def _cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorised(update):
+        return
+    await update.message.reply_text(_HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
 async def _cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -409,6 +422,7 @@ async def build_application(
     app.bot_data["handle"] = handle
 
     app.add_handler(CommandHandler("start", _cmd_start))
+    app.add_handler(CommandHandler("help", _cmd_help))
     app.add_handler(CommandHandler("status", _cmd_status))
     app.add_handler(CommandHandler("recent", _cmd_recent))
     app.add_handler(CommandHandler("xg", _cmd_xg))
