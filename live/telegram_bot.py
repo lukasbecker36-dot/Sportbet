@@ -192,10 +192,82 @@ async def _cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Sportbet live monitor connected.\n"
         "/watch <event_id> — start watching a SofaScore match (multiple OK)\n"
         "/status — list active monitors\n"
+        "/recent — last 10 fired signals (across all matches)\n"
+        "/xg <event_id> — current xg_rate_15m + score for a live match\n"
         "/stop [event_id] — stop one monitor (or all if no id)\n"
-        "/funds — show Betfair balance\n"
+        "/funds — show Betfair balance (needs Account API perm)\n"
         "/kill — emergency disable of all bet placement",
     )
+
+
+async def _cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorised(update):
+        return
+    alerts = list(ctx.application.bot_data.get("recent_alerts") or [])
+    if not alerts:
+        await update.message.reply_text("No signals have fired yet.")
+        return
+    lines = ["<b>Recent signals</b> (newest first):"]
+    for a in alerts[:10]:
+        ts = a["ts"].replace("T", " ").replace("+00:00", "Z")
+        lines.append(
+            f"• {ts}  {a['home']} v {a['away']}\n"
+            f"   min {a['minute']}'  score {a['score']}  "
+            f"xG15 <b>{a['xg_rate']:.2f}</b>  "
+            f"{a['market']}@<b>{a['price']:.2f}</b>  "
+            f"EV <b>{a['ev']:+.2f}</b>  ({a['mode']})"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def _cmd_xg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorised(update):
+        return
+    parts = (update.message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await update.message.reply_text("Usage: /xg <event_id>")
+        return
+    event_id = int(parts[1])
+
+    # Local imports to avoid circular ones (this file is imported by runner.py).
+    import asyncio
+    from live.sofascore import SofaScore
+    from live.monitor import (
+        parse_shots, xg_rate_window, goals_total, _fmt_score, _match_minute,
+    )
+
+    def _fetch():
+        with SofaScore() as s:
+            return s.event(event_id), s.shotmap(event_id)
+
+    try:
+        ev, raw_shots = await asyncio.to_thread(_fetch)
+    except Exception as e:  # noqa: BLE001
+        await update.message.reply_text(f"Fetch error: {e}")
+        return
+
+    home = ev.get("homeTeam", {}).get("name", "?")
+    away = ev.get("awayTeam", {}).get("name", "?")
+    status_desc = (ev.get("status", {}) or {}).get("description", "?")
+    shots = parse_shots(raw_shots)
+    minute = _match_minute(ev) or 0
+    if minute == 0 and shots:
+        minute = max((s.minute for s in shots), default=0)
+    score = _fmt_score(shots, minute) if shots else "0-0"
+    cum_h = sum(s.xg for s in shots if s.is_home and s.minute <= minute)
+    cum_a = sum(s.xg for s in shots if not s.is_home and s.minute <= minute)
+    rate10 = xg_rate_window(shots, minute, window=10)
+    rate15 = xg_rate_window(shots, minute, window=15)
+    rate20 = xg_rate_window(shots, minute, window=20)
+    gt = goals_total(shots, minute)
+
+    msg = (
+        f"<b>{home} v {away}</b>  <i>({status_desc})</i>\n"
+        f"min <b>{minute}'</b>  score <b>{score}</b>  goals {gt}  shots {len(shots)}\n"
+        f"cumulative xG: H <b>{cum_h:.2f}</b> · A <b>{cum_a:.2f}</b> · total <b>{cum_h+cum_a:.2f}</b>\n"
+        f"xg_rate: <b>15m {rate15:.2f}</b>  ·  10m {rate10:.2f}  ·  20m {rate20:.2f}"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
 async def _cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -338,6 +410,8 @@ async def build_application(
 
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("status", _cmd_status))
+    app.add_handler(CommandHandler("recent", _cmd_recent))
+    app.add_handler(CommandHandler("xg", _cmd_xg))
     app.add_handler(CommandHandler("funds", _cmd_funds))
     app.add_handler(CommandHandler("kill", _cmd_kill))
     app.add_handler(CallbackQueryHandler(_on_callback))

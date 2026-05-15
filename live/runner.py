@@ -29,6 +29,7 @@ import logging
 import os
 import signal
 import time
+from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
@@ -63,6 +64,8 @@ class RunnerState:
         # event_id -> {task, label, last_tick, strategy}
         self.monitors: dict[int, dict] = {}
         self.daily_staked: float = 0.0
+        # Recent fired alerts, newest-first. Reused by /recent.
+        self.recent_alerts: deque[dict] = deque(maxlen=25)
 
 
 STATE = RunnerState()
@@ -90,7 +93,12 @@ def _strategy_for(tournament_id: int | None) -> tuple[float, float, int, int, fl
 # The per-match monitor task
 # --------------------------------------------------------------------------- #
 async def _monitor_match(event_id: int) -> None:
-    """Poll SofaScore for one match, push gated alerts to Telegram."""
+    """Poll SofaScore for one match, push gated alerts to Telegram.
+
+    The kickoff card is sent ONCE per task, after the first successful event
+    fetch. All transient failures (SofaScore proxy hiccups, Betfair lookup
+    flakes) just retry on the next poll — they don't kill the task.
+    """
     sofa = SofaScore()
     bf = STATE.bf
     handle = STATE.bot_handle
@@ -99,59 +107,66 @@ async def _monitor_match(event_id: int) -> None:
     market: OverGoalsMarket | None = None
     fired = False
     home = away = "?"
+    threshold = market_line = win_rate = 0.0
+    min_min = max_min = 0
+    kickoff_card_sent = False
+    slot = STATE.monitors.setdefault(event_id, {})
+    slot["label"] = "?"
+    slot["last_tick"] = "connecting…"
 
     try:
-        # Bootstrap match meta once
-        ev = await asyncio.to_thread(sofa.event, event_id)
-        home = ev["homeTeam"]["name"]
-        away = ev["awayTeam"]["name"]
-        ko_ts = ev.get("startTimestamp")
-        kickoff = (
-            datetime.fromtimestamp(ko_ts, tz=timezone.utc) if ko_ts else
-            datetime.now(timezone.utc)
-        )
-        tournament_id = (
-            (ev.get("tournament", {}) or {}).get("uniqueTournament", {}) or {}
-        ).get("id")
-        tournament_name = (ev.get("tournament", {}) or {}).get("name", "?")
-        strategy = _strategy_for(tournament_id)
-        threshold, market_line, min_min, max_min, win_rate = strategy
-        slot = STATE.monitors.setdefault(event_id, {})
-        slot["label"] = f"{home} v {away}"
-        slot["strategy"] = strategy
-        slot["last_tick"] = None
-        await handle.send_text(
-            f"👀 Watching <b>{home} v {away}</b>  "
-            f"<i>({tournament_name}, event {event_id})</i>\n"
-            f"strategy: xG≥<b>{threshold}</b>, over_<b>{market_line}</b>, "
-            f"min <b>{min_min}-{max_min}</b>, win_rate=<b>{win_rate:.2f}</b>",
-        )
-
-        # Locate the Betfair market for this strategy's line.
-        market = await asyncio.to_thread(
-            bf.find_over_under_market, home, away, kickoff, market_line,
-        )
-        if market is None:
-            await handle.send_text(
-                f"⚠ Betfair Over {market_line} market not found yet "
-                f"for {home} v {away}; will retry on each tick.",
-            )
-        else:
-            await handle.send_text(
-                f"📈 Betfair market: {market.market_name} (id {market.market_id})",
-            )
-
-        prematch_notified = False
         while True:
+            # Fetch event meta — retry forever on transient failures.
             try:
                 ev = await asyncio.to_thread(sofa.event, event_id)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("SofaScore event fetch failed: %s", exc)
+                logger.warning("SofaScore event %s fetch failed: %s", event_id, exc)
                 await asyncio.sleep(config.LIVE_POLL_SECONDS)
                 continue
 
+            home = ev.get("homeTeam", {}).get("name", "?")
+            away = ev.get("awayTeam", {}).get("name", "?")
+            ko_ts = ev.get("startTimestamp") or 0
+            kickoff = (
+                datetime.fromtimestamp(ko_ts, tz=timezone.utc) if ko_ts else
+                datetime.now(timezone.utc)
+            )
+            tournament_id = (
+                (ev.get("tournament", {}) or {}).get("uniqueTournament", {}) or {}
+            ).get("id")
+            tournament_name = (ev.get("tournament", {}) or {}).get("name", "?")
+            strategy = _strategy_for(tournament_id)
+            threshold, market_line, min_min, max_min, win_rate = strategy
+            slot["label"] = f"{home} v {away}"
+            slot["strategy"] = strategy
+
             status_type = ev.get("status", {}).get("type")
             status_desc = ev.get("status", {}).get("description") or ""
+
+            # Locate Betfair market once we have meta.
+            if market is None:
+                try:
+                    market = await asyncio.to_thread(
+                        bf.find_over_under_market, home, away, kickoff, market_line,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Betfair market lookup failed for %s: %s", event_id, exc)
+                    market = None
+
+            # One consolidated kickoff card per task.
+            if not kickoff_card_sent:
+                market_line_msg = (
+                    f"📈 {market.market_name}" if market
+                    else f"⚠ Betfair Over {market_line} market not found yet"
+                )
+                ko_iso = kickoff.isoformat(timespec="minutes") if ko_ts else "?"
+                await handle.send_text(
+                    f"👀 <b>{home} v {away}</b>  <i>({tournament_name})</i>\n"
+                    f"strategy: xG≥<b>{threshold}</b>, over_<b>{market_line}</b>, "
+                    f"min <b>{min_min}-{max_min}</b>, win_rate=<b>{win_rate:.0%}</b>\n"
+                    f"kickoff {ko_iso}Z  ·  {market_line_msg}",
+                )
+                kickoff_card_sent = True
 
             if status_type in {"finished", "postponed", "canceled"}:
                 await handle.send_text(
@@ -160,26 +175,15 @@ async def _monitor_match(event_id: int) -> None:
                 )
                 return
 
-            # Don't poll the shotmap if the match hasn't started yet — SofaScore
-            # returns 404 on the shotmap endpoint pre-kickoff. Poll more loosely
-            # to avoid hammering them for 12+ hours before kickoff.
+            # Pre-kickoff: don't hit the shotmap endpoint (404s on unstarted
+            # matches). Poll loosely until kickoff is within 10 min.
             if status_type != "inprogress":
-                ko_ts = ev.get("startTimestamp") or 0
                 seconds_to_ko = max(0, ko_ts - time.time()) if ko_ts else None
                 slot["last_tick"] = (
                     f"pre-match ({status_desc})"
-                    + (f", kickoff in {int(seconds_to_ko//60)}m" if seconds_to_ko else "")
+                    + (f", ko in {int(seconds_to_ko//60)}m" if seconds_to_ko else "")
                 )
-                if not prematch_notified:
-                    await handle.send_text(
-                        f"⏳ <b>{home} v {away}</b> not started yet "
-                        f"({status_desc}). I'll wake up at kickoff.",
-                    )
-                    prematch_notified = True
-                if seconds_to_ko is None or seconds_to_ko > 600:
-                    sleep_for = 300  # 5 min until close to kickoff
-                else:
-                    sleep_for = 30   # tight poll in the final 10 min
+                sleep_for = 300 if (seconds_to_ko is None or seconds_to_ko > 600) else 30
                 await asyncio.sleep(sleep_for)
                 continue
 
@@ -204,15 +208,14 @@ async def _monitor_match(event_id: int) -> None:
                 f"{minute}'  {score}  xg15={rate:.2f}  shots={len(shots)}"
             )
 
-            # Re-attempt market lookup if needed
+            # Re-attempt market lookup silently if needed.
             if market is None and minute >= 1:
-                market = await asyncio.to_thread(
-                    bf.find_over_under_market, home, away, kickoff, market_line,
-                )
-                if market is not None:
-                    await handle.send_text(
-                        f"📈 Betfair market found: {market.market_name}",
+                try:
+                    market = await asyncio.to_thread(
+                        bf.find_over_under_market, home, away, kickoff, market_line,
                     )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Betfair market lookup failed: %s", exc)
 
             if not fired:
                 alert_payload = _candidate_alert(
@@ -287,19 +290,31 @@ async def _push_alert(
     else:
         expires_at = time.time()  # full_auto — placement happens here
 
+    effective_line = market_line if market_line is not None else config.LIVE_MARKET_LINE
     alert = tg.PendingAlert(
         alert_id=tg.new_alert_id(),
         event_id=event_id,
         market_id=market.market_id,
         home=home, away=away,
         minute=minute,
-        market_line=market_line if market_line is not None else config.LIVE_MARKET_LINE,
+        market_line=effective_line,
         price=price, xg_rate=rate, score=score, ev=ev_value,
         expires_at=expires_at,
         chat_id=int(config.TELEGRAM_CHAT_ID),
         mode=mode,
         placement_callback=lambda a: _place_bet(a, market),
     )
+
+    STATE.recent_alerts.appendleft({
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "event_id": event_id,
+        "home": home, "away": away,
+        "minute": minute, "score": score,
+        "xg_rate": rate,
+        "market": f"over_{effective_line}",
+        "price": price, "ev": ev_value,
+        "mode": mode,
+    })
 
     if mode == "full_auto":
         # Place first, then send a result-only message.
@@ -472,6 +487,7 @@ async def _amain() -> None:
     STATE.bot_handle = handle
     app.bot_data["betfair"] = bf
     app.bot_data["monitor_state"] = {"active": None}
+    app.bot_data["recent_alerts"] = STATE.recent_alerts
 
     # 3. Wire status command to STATE
     async def _refresh_status_loop():
