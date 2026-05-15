@@ -138,7 +138,9 @@ async def _monitor_match(event_id: int) -> None:
 
     # Cache one market per goal-line so multi-strategy lookups don't repeat.
     markets_by_line: dict[float, OverGoalsMarket | None] = {}
-    fired = False
+    # Track per-strategy firing — each strategy fires at most once per match,
+    # but multiple strategies CAN fire on the same fixture (no dedup).
+    fired: set[int] = set()
     home = away = "?"
     strategies: list[tuple] = []
     kickoff_card_sent = False
@@ -209,9 +211,13 @@ async def _monitor_match(event_id: int) -> None:
                 kickoff_card_sent = True
 
             if status_type in {"finished", "postponed", "canceled"}:
+                fire_count = len(fired)
+                tail = (
+                    f"{fire_count} bet{'s' if fire_count != 1 else ''} placed."
+                    if fire_count else "No signal fired."
+                )
                 await handle.send_text(
-                    f"🏁 <b>{home} v {away}</b> — {status_desc}. "
-                    + ("Bet stayed open." if fired else "No signal fired."),
+                    f"🏁 <b>{home} v {away}</b> — {status_desc}. {tail}",
                 )
                 return
 
@@ -248,42 +254,46 @@ async def _monitor_match(event_id: int) -> None:
                 f"{minute}'  {score}  xg15={rate:.2f}  shots={len(shots)}"
             )
 
-            # One-bet-per-match guard: only walk strategies if we haven't
-            # already fired anything for this fixture.
-            if not fired:
-                for thr, kind, val, mn, mx, wr in strategies:
-                    if minute < mn or minute > mx:
-                        continue
-                    if rate < thr:
-                        continue
-                    target_line = _resolve_line(kind, val, gt)
-                    if target_line is None:
-                        continue
-                    market = await _market_for(target_line, kickoff, home, away)
-                    if market is None:
-                        continue
-                    price_snap = await asyncio.to_thread(bf.fetch_price, market)
-                    price = _best_price(price_snap)
-                    if price is None:
-                        logger.info(
-                            "min=%d xg=%.2f line=%.1f: no Betfair price (status=%s)",
-                            minute, rate, target_line, price_snap.status,
-                        )
-                        continue
-                    ev_value = expected_value(price, wr)
-                    if ev_value < config.LIVE_MIN_EV:
-                        logger.info(
-                            "min=%d xg=%.2f line=%.1f LTP=%.2f EV=%.3f below floor",
-                            minute, rate, target_line, price, ev_value,
-                        )
-                        continue
-                    await _push_alert(
-                        event_id, market, home, away,
-                        minute, rate, score, price, ev_value,
-                        market_line=target_line,
+            # Walk each strategy independently — no dedup. A strategy fires
+            # at most once per match; different strategies can both fire on
+            # the same fixture (they typically target different lines /
+            # minutes, so the exposure is on separate Betfair markets).
+            for i, (thr, kind, val, mn, mx, wr) in enumerate(strategies):
+                if i in fired:
+                    continue
+                if minute < mn or minute > mx:
+                    continue
+                if rate < thr:
+                    continue
+                target_line = _resolve_line(kind, val, gt)
+                if target_line is None:
+                    continue
+                market = await _market_for(target_line, kickoff, home, away)
+                if market is None:
+                    continue
+                price_snap = await asyncio.to_thread(bf.fetch_price, market)
+                price = _best_price(price_snap)
+                if price is None:
+                    logger.info(
+                        "min=%d xg=%.2f line=%.1f: no Betfair price (status=%s)",
+                        minute, rate, target_line, price_snap.status,
                     )
-                    fired = True
-                    break  # one bet per match
+                    continue
+                ev_value = expected_value(price, wr)
+                if ev_value < config.LIVE_MIN_EV:
+                    logger.info(
+                        "min=%d xg=%.2f line=%.1f LTP=%.2f EV=%.3f below floor",
+                        minute, rate, target_line, price, ev_value,
+                    )
+                    continue
+                await _push_alert(
+                    event_id, market, home, away,
+                    minute, rate, score, price, ev_value,
+                    market_line=target_line,
+                )
+                fired.add(i)
+                # Don't break — give other eligible strategies a chance on
+                # this same tick (rare but possible).
 
             await asyncio.sleep(config.LIVE_POLL_SECONDS)
 

@@ -131,7 +131,7 @@ LIVE_MIN_EV = 0.10
 # Bet placement caps (defence in depth).
 LIVE_STAKE_GBP = 10.0           # flat per trade
 LIVE_MAX_STAKE_GBP = 10.0       # hard cap; placement aborts if exceeded
-LIVE_DAILY_STAKE_CAP_GBP = 30.0 # rough 3-trade-per-day ceiling
+LIVE_DAILY_STAKE_CAP_GBP = 60.0 # 6 x £10 trades across all matches/strategies
 LIVE_CONFIRM_TIMEOUT_S = 60     # manual mode: seconds before alert expires
 LIVE_POLL_SECONDS = 30
 
