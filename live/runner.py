@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import signal
 import time
@@ -71,22 +72,53 @@ class RunnerState:
 STATE = RunnerState()
 
 
-def _strategy_for(tournament_id: int | None) -> tuple[float, float, int, int, float]:
-    """Return (threshold, market_line, min_min, max_min, win_rate) for a league.
+def _strategies_for(tournament_id: int | None) -> list[tuple]:
+    """Return a list of strategy tuples for the given league.
 
-    Falls back to the global defaults if the SofaScore tournament id isn't in
-    config.LIVE_STRATEGY_BY_LEAGUE.
+    Each tuple: (threshold, line_kind, line_value, min_min, max_min, win_rate)
+      line_kind = "fixed"     -> back over_{line_value} when goals == floor(line_value)
+      line_kind = "relative"  -> back over_{goals + line_value}
+
+    Falls back to a single global-default strategy if the league isn't
+    explicitly configured.
     """
-    by_league = getattr(config, "LIVE_STRATEGY_BY_LEAGUE", {}) or {}
-    if tournament_id is not None and tournament_id in by_league:
-        return by_league[tournament_id]
-    return (
-        config.LIVE_XG_THRESHOLD,
-        config.LIVE_MARKET_LINE,
-        config.LIVE_MIN_MINUTE,
-        config.LIVE_MAX_MINUTE,
-        config.LIVE_BASE_WIN_RATE,
-    )
+    by_league = getattr(config, "LIVE_STRATEGIES_BY_LEAGUE", None)
+    if by_league and tournament_id in by_league:
+        return list(by_league[tournament_id])
+    # Back-compat: derive from the singular dict if present.
+    legacy = getattr(config, "LIVE_STRATEGY_BY_LEAGUE", {}) or {}
+    if tournament_id in legacy:
+        thr, line, mn, mx, wr = legacy[tournament_id]
+        return [(thr, "fixed", line, mn, mx, wr)]
+    return [(
+        config.LIVE_XG_THRESHOLD, "fixed", config.LIVE_MARKET_LINE,
+        config.LIVE_MIN_MINUTE, config.LIVE_MAX_MINUTE, config.LIVE_BASE_WIN_RATE,
+    )]
+
+
+def _strategy_for(tournament_id: int | None) -> tuple[float, float, int, int, float]:
+    """Legacy single-strategy accessor (returns the FIRST strategy for the league)."""
+    strats = _strategies_for(tournament_id)
+    s = strats[0]
+    # Drop the line_kind so the legacy 5-tuple shape is preserved.
+    return (s[0], s[2], s[3], s[4], s[5])
+
+
+def _resolve_line(line_kind: str, line_value: float, goals: int) -> float | None:
+    """Translate (line_kind, line_value, current_goals) -> target market line.
+
+    Returns None when the candidate line doesn't have a real Betfair market
+    we can hit (we only hold 0.5/1.5/2.5/3.5)."""
+    if line_kind == "fixed":
+        market_line = float(line_value)
+        if math.floor(market_line) != goals:
+            return None
+        return market_line
+    # relative
+    market_line = float(goals + line_value)
+    if market_line not in (0.5, 1.5, 2.5, 3.5):
+        return None
+    return market_line
 
 
 # --------------------------------------------------------------------------- #
@@ -104,15 +136,29 @@ async def _monitor_match(event_id: int) -> None:
     handle = STATE.bot_handle
     assert bf is not None and handle is not None
 
-    market: OverGoalsMarket | None = None
+    # Cache one market per goal-line so multi-strategy lookups don't repeat.
+    markets_by_line: dict[float, OverGoalsMarket | None] = {}
     fired = False
     home = away = "?"
-    threshold = market_line = win_rate = 0.0
-    min_min = max_min = 0
+    strategies: list[tuple] = []
     kickoff_card_sent = False
     slot = STATE.monitors.setdefault(event_id, {})
     slot["label"] = "?"
     slot["last_tick"] = "connecting…"
+
+    async def _market_for(line: float, kickoff_dt: datetime,
+                          home_: str, away_: str) -> OverGoalsMarket | None:
+        if line in markets_by_line:
+            return markets_by_line[line]
+        try:
+            m = await asyncio.to_thread(
+                bf.find_over_under_market, home_, away_, kickoff_dt, line,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Betfair market lookup failed (line %s): %s", line, exc)
+            m = None
+        markets_by_line[line] = m
+        return m
 
     try:
         while True:
@@ -135,36 +181,30 @@ async def _monitor_match(event_id: int) -> None:
                 (ev.get("tournament", {}) or {}).get("uniqueTournament", {}) or {}
             ).get("id")
             tournament_name = (ev.get("tournament", {}) or {}).get("name", "?")
-            strategy = _strategy_for(tournament_id)
-            threshold, market_line, min_min, max_min, win_rate = strategy
+            strategies = _strategies_for(tournament_id)
             slot["label"] = f"{home} v {away}"
-            slot["strategy"] = strategy
+            slot["strategy"] = strategies
 
             status_type = ev.get("status", {}).get("type")
             status_desc = ev.get("status", {}).get("description") or ""
 
-            # Locate Betfair market once we have meta.
-            if market is None:
-                try:
-                    market = await asyncio.to_thread(
-                        bf.find_over_under_market, home, away, kickoff, market_line,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Betfair market lookup failed for %s: %s", event_id, exc)
-                    market = None
-
             # One consolidated kickoff card per task.
             if not kickoff_card_sent:
-                market_line_msg = (
-                    f"📈 {market.market_name}" if market
-                    else f"⚠ Betfair Over {market_line} market not found yet"
-                )
+                strat_lines = []
+                for thr, kind, val, mn, mx, wr in strategies:
+                    if kind == "fixed":
+                        bet_desc = f"over_{val}"
+                    else:
+                        bet_desc = f"over_(goals+{val:g}) ⚡early"
+                    strat_lines.append(
+                        f"  • xG≥<b>{thr}</b>  {bet_desc}  "
+                        f"min <b>{mn}-{mx}</b>  win={wr:.0%}"
+                    )
                 ko_iso = kickoff.isoformat(timespec="minutes") if ko_ts else "?"
                 await handle.send_text(
                     f"👀 <b>{home} v {away}</b>  <i>({tournament_name})</i>\n"
-                    f"strategy: xG≥<b>{threshold}</b>, over_<b>{market_line}</b>, "
-                    f"min <b>{min_min}-{max_min}</b>, win_rate=<b>{win_rate:.0%}</b>\n"
-                    f"kickoff {ko_iso}Z  ·  {market_line_msg}",
+                    f"kickoff {ko_iso}Z\n"
+                    + "\n".join(strat_lines),
                 )
                 kickoff_card_sent = True
 
@@ -208,43 +248,42 @@ async def _monitor_match(event_id: int) -> None:
                 f"{minute}'  {score}  xg15={rate:.2f}  shots={len(shots)}"
             )
 
-            # Re-attempt market lookup silently if needed.
-            if market is None and minute >= 1:
-                try:
-                    market = await asyncio.to_thread(
-                        bf.find_over_under_market, home, away, kickoff, market_line,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Betfair market lookup failed: %s", exc)
-
+            # One-bet-per-match guard: only walk strategies if we haven't
+            # already fired anything for this fixture.
             if not fired:
-                alert_payload = _candidate_alert(
-                    shots, minute,
-                    threshold, market_line, min_min, max_min,
-                )
-                if alert_payload and market is not None:
+                for thr, kind, val, mn, mx, wr in strategies:
+                    if minute < mn or minute > mx:
+                        continue
+                    if rate < thr:
+                        continue
+                    target_line = _resolve_line(kind, val, gt)
+                    if target_line is None:
+                        continue
+                    market = await _market_for(target_line, kickoff, home, away)
+                    if market is None:
+                        continue
                     price_snap = await asyncio.to_thread(bf.fetch_price, market)
                     price = _best_price(price_snap)
                     if price is None:
                         logger.info(
-                            "xG signal at minute %d but no Betfair price (status=%s)",
-                            minute, price_snap.status,
+                            "min=%d xg=%.2f line=%.1f: no Betfair price (status=%s)",
+                            minute, rate, target_line, price_snap.status,
                         )
-                    else:
-                        ev_value = expected_value(price, win_rate)
-                        if ev_value >= config.LIVE_MIN_EV:
-                            await _push_alert(
-                                event_id, market, home, away,
-                                minute, rate, score, price, ev_value,
-                                market_line=market_line,
-                            )
-                            fired = True
-                        else:
-                            logger.info(
-                                "xG signal at minute %d but live EV %.3f < %.2f floor "
-                                "(LTP %.2f); not alerting.",
-                                minute, ev_value, config.LIVE_MIN_EV, price,
-                            )
+                        continue
+                    ev_value = expected_value(price, wr)
+                    if ev_value < config.LIVE_MIN_EV:
+                        logger.info(
+                            "min=%d xg=%.2f line=%.1f LTP=%.2f EV=%.3f below floor",
+                            minute, rate, target_line, price, ev_value,
+                        )
+                        continue
+                    await _push_alert(
+                        event_id, market, home, away,
+                        minute, rate, score, price, ev_value,
+                        market_line=target_line,
+                    )
+                    fired = True
+                    break  # one bet per match
 
             await asyncio.sleep(config.LIVE_POLL_SECONDS)
 

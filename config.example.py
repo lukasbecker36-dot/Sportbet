@@ -85,19 +85,43 @@ LIVE_AUTO_DISCOVER = True
 LIVE_AUTO_DISCOVER_INTERVAL_S = 60      # how often to scan
 LIVE_AUTO_DISCOVER_LOOKAHEAD_H = 3      # also watch fixtures starting in next N hours
 
-# Per-league overrides — keyed by SofaScore uniqueTournament id.
-# Each tuple holds the robust strategy from the 24/25 + 25/26 holdout
-# (results/per_league_best.csv) with the *averaged* win-rate used for EV.
+# Per-league strategies — each league can list multiple strategies. The
+# runner walks them in order on every tick; the first one that fires (passes
+# xG threshold AND Betfair live EV gate) settles the match's single bet.
 #
-#   (threshold, market_line, min_minute, max_minute, win_rate)
+# Each entry: (threshold, line_kind, line_value, min_min, max_min, win_rate)
+#   line_kind = "fixed"     -> back over_{line_value} when goals == floor(line_value)
+#   line_kind = "relative"  -> back over_{goals + line_value}  (e.g. 1.5 = "need 2 more")
 #
-# Source: backtest min(EV across both seasons) ≥ 0.05 with n_priced ≥ 30/season.
+# Source: 24/25 + 25/26 holdout, robustness filter min(EV) ≥ 0.10 in both
+# seasons with n_priced ≥ 30/season. See results/combined_all_leagues.csv.
+LIVE_STRATEGIES_BY_LEAGUE: dict[int, list[tuple]] = {
+    17: [  # ENG-Premier League
+        (0.20, "fixed",    2.5, 55, 85, 0.572),  # late
+        (0.40, "relative", 1.5, 15, 55, 0.597),  # early-edge
+    ],
+    8: [   # ESP-La Liga
+        (0.30, "fixed",    1.5, 55, 80, 0.590),  # late
+        (0.40, "relative", 1.5, 15, 55, 0.562),  # early-edge
+    ],
+    23: [  # ITA-Serie A
+        (0.25, "fixed",    3.5, 30, 85, 0.505),  # late
+        (0.40, "relative", 1.5, 15, 55, 0.488),  # early-edge
+    ],
+    35: [  # GER-Bundesliga — early-edge unstable in this league, late only
+        (0.20, "fixed",    2.5, 30, 75, 0.783),
+    ],
+    34: [  # FRA-Ligue 1 — early-edge unstable in this league, late only
+        (0.50, "fixed",    1.5, 30, 80, 0.755),
+    ],
+}
+
+# Backward-compat alias — older code paths still look this up. Mirrors the
+# FIRST strategy per league (which is the late one in each list above).
 LIVE_STRATEGY_BY_LEAGUE: dict[int, tuple] = {
-    17: (0.20, 2.5, 55, 85, 0.572),  # ENG-Premier League
-    8:  (0.30, 1.5, 55, 80, 0.590),  # ESP-La Liga
-    23: (0.25, 3.5, 30, 85, 0.505),  # ITA-Serie A
-    35: (0.20, 2.5, 30, 75, 0.783),  # GER-Bundesliga
-    34: (0.50, 1.5, 30, 80, 0.755),  # FRA-Ligue 1
+    league_id: (s[0][0], s[0][2], s[0][3], s[0][4], s[0][5])
+    for league_id, s in LIVE_STRATEGIES_BY_LEAGUE.items()
+    if s and s[0][1] == "fixed"
 }
 
 # EV gating: only fire the Telegram alert if both (a) the xG threshold is met
