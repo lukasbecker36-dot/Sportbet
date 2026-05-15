@@ -2,6 +2,6 @@ requests
 pandas
 numpy
 pytest
-tls_requests
+curl_cffi>=0.7
 python-telegram-bot>=20.7
 betfairlightweight>=2.20.0

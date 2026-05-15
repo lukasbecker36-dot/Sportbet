@@ -1,8 +1,10 @@
 """SofaScore API client.
 
-SofaScore puts a Cloudflare TLS-fingerprint check in front of their public
-JSON API. Plain ``requests`` gets 403. ``tls_requests`` (a soccerdata transitive
-dep) impersonates a real Chrome handshake so the requests go through.
+SofaScore fronts its public JSON API with a Cloudflare TLS-fingerprint check
+(JA3). Plain ``requests`` always gets 403. We use ``curl_cffi`` to impersonate
+a real Chrome TLS handshake so the requests go through. ``curl_cffi`` is a
+Python wrapper around ``curl-impersonate``; it has manylinux + Windows wheels
+for Python 3.8–3.13.
 
 Endpoints used:
   /api/v1/sport/football/scheduled-events/{YYYY-MM-DD}
@@ -12,16 +14,15 @@ Endpoints used:
 
 The shotmap is what makes this useful for live alerting: every shot row has
 ``xg``, ``xgot``, ``isHome``, ``time`` (minute), ``addedTime``, ``timeSeconds``,
-``shotType``, and ``situation`` — and it updates while the match is in play
-(verified on 2026-05-14 against an in-progress Brazilian cup tie).
+``shotType``, and ``situation`` — and it updates while the match is in play.
 """
 
 from __future__ import annotations
 
 from datetime import date
-from typing import Iterator
+from typing import Iterable, Iterator
 
-import tls_requests
+from curl_cffi.requests import Session
 
 PL_UNIQUE_TOURNAMENT_ID = 17
 BASE = "https://api.sofascore.com/api/v1"
@@ -35,12 +36,16 @@ _HEADERS = {
     "Referer": "https://www.sofascore.com/",
 }
 
+# curl_cffi impersonation profile. "chrome124" is the most recent at the time
+# of writing; SofaScore's JA3 acceptance has been stable for older profiles too.
+_IMPERSONATE = "chrome124"
+
 
 class SofaScore:
-    """Thin TLS-spoofed wrapper around SofaScore's public JSON endpoints."""
+    """TLS-spoofed wrapper around SofaScore's public JSON endpoints."""
 
-    def __init__(self, *, client_identifier: str = "chrome_124") -> None:
-        self._client = tls_requests.Client(client_identifier=client_identifier)
+    def __init__(self, *, impersonate: str = _IMPERSONATE) -> None:
+        self._client = Session(impersonate=impersonate)
 
     def __enter__(self) -> "SofaScore":
         return self
@@ -80,7 +85,3 @@ def filter_pl(events: Iterable[dict]) -> list[dict]:
         if (e.get("tournament", {}).get("uniqueTournament", {}) or {}).get("id")
         == PL_UNIQUE_TOURNAMENT_ID
     ]
-
-
-# Re-export Iterable for the helper signature above
-from typing import Iterable  # noqa: E402,F401  (kept at bottom to avoid forward ref)
