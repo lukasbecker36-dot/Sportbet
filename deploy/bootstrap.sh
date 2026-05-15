@@ -21,7 +21,7 @@ echo "[1/6] apt update + install base packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq \
-    python3.11 python3.11-venv python3-pip \
+    python3 python3-venv python3-pip \
     git ca-certificates curl tzdata unattended-upgrades
 
 echo "[2/6] timezone -> UTC"
@@ -61,7 +61,7 @@ sudo -u "${TARGET_USER}" bash <<INNER
 set -euo pipefail
 cd "${APP_DIR}"
 if [ ! -d ".venv" ]; then
-    python3.11 -m venv .venv
+    python3 -m venv .venv
 fi
 .venv/bin/pip install -q -U pip wheel
 .venv/bin/pip install -q -r requirements.txt
