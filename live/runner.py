@@ -37,6 +37,7 @@ from typing import Optional
 from telegram.ext import Application
 
 import config
+from live import paper_log
 from live import telegram_bot as tg
 from live.betfair_client import (
     BetfairLive, OverGoalsMarket, PriceSnapshot,
@@ -75,11 +76,12 @@ STATE = RunnerState()
 def _settle_alerts_for_match(event_id: int, final_total: int) -> int:
     """Settle every fired alert for this match against the final score.
 
-    Returns the number of alerts newly settled. P&L uses PAPER_STAKE_GBP — a
-    hypothetical flat stake — regardless of what (if anything) was actually
-    placed via Betfair.
+    Each settled alert is appended to the paper-trade CSV log so /pnl
+    survives bot restarts. P&L uses PAPER_STAKE_GBP — a hypothetical flat
+    stake — regardless of what was actually placed.
     """
     stake = float(getattr(config, "PAPER_STAKE_GBP", 5.0))
+    ts_settled = datetime.now(timezone.utc).isoformat(timespec="seconds")
     n = 0
     for a in STATE.recent_alerts:
         if a.get("event_id") != event_id or a.get("settled"):
@@ -95,6 +97,11 @@ def _settle_alerts_for_match(event_id: int, final_total: int) -> int:
         a["won"] = bool(won)
         a["final_total"] = int(final_total)
         a["paper_profit_gbp"] = round(float(profit), 2)
+        try:
+            paper_log.append_settled(a, ts_settled=ts_settled)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("paper-log append failed for alert %s: %s",
+                           a.get("event_id"), exc)
         n += 1
     return n
 
@@ -374,6 +381,7 @@ async def _push_alert(
     price: float, ev_value: float,
     *,
     market_line: float | None = None,
+    league: str = "",
 ) -> None:
     handle = STATE.bot_handle
     assert handle is not None
@@ -407,6 +415,7 @@ async def _push_alert(
     STATE.recent_alerts.appendleft({
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "event_id": event_id,
+        "league": league,
         "home": home, "away": away,
         "minute": minute, "score": score,
         "xg_rate": rate,

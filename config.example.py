@@ -140,6 +140,10 @@ LIVE_POLL_SECONDS = 30
 # is just "what would my running P&L be if I'd put £X on every signal?".
 PAPER_STAKE_GBP = 5.0
 
+# Append-only CSV of every settled paper trade. /pnl totals are read from
+# here so they survive bot restarts. Path relative to working directory.
+PAPER_TRADES_CSV = "data/paper_trades.csv"
+
 # Auto-place behaviour:
 #   "manual"         — Telegram message with [Place £10] / [Skip] buttons.
 #                      Nothing happens until you tap. Expires after

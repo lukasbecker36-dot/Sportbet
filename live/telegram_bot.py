@@ -249,28 +249,36 @@ async def _cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorised(update):
         return
+    from live import paper_log
+    s = paper_log.stats()
     alerts = list(ctx.application.bot_data.get("recent_alerts") or [])
-    settled = [a for a in alerts if a.get("settled")]
     pending = [a for a in alerts if not a.get("settled")]
-    if not settled and not pending:
+    stake = float(getattr(config, "PAPER_STAKE_GBP", 5.0))
+    if s["n"] == 0 and not pending:
         await update.message.reply_text("No signals tracked yet.")
         return
-    stake = float(getattr(config, "PAPER_STAKE_GBP", 5.0))
-    total_pnl = sum((a.get("paper_profit_gbp") or 0) for a in settled)
-    wins = sum(1 for a in settled if a.get("won"))
-    losses = sum(1 for a in settled if a.get("settled") and not a.get("won"))
-    n = wins + losses
-    win_rate = (wins / n * 100) if n else 0.0
-    total_staked = stake * n
-    roi = (total_pnl / total_staked * 100) if total_staked else 0.0
-    msg = (
-        f"<b>📊 Paper P&L</b>  (£{stake:g}/signal)\n"
-        f"settled: <b>{n}</b>  ({wins}W / {losses}L  ·  win rate {win_rate:.1f}%)\n"
-        f"pending: <b>{len(pending)}</b>\n"
-        f"running P&L: <b>£{total_pnl:+.2f}</b>  on £{total_staked:.0f} staked  "
-        f"({roi:+.1f}% ROI)"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    msg_lines = [
+        f"<b>📊 Paper P&L</b>  (£{stake:g}/signal)",
+        f"settled: <b>{s['n']}</b>  "
+        f"({s['wins']}W / {s['losses']}L  ·  win rate {s['win_rate']*100:.1f}%)",
+        f"pending: <b>{len(pending)}</b>",
+        f"running P&L: <b>£{s['total_pnl']:+.2f}</b>  "
+        f"on £{s['total_staked']:.0f} staked  ({s['roi_pct']:+.1f}% ROI)",
+    ]
+    if s["leagues"]:
+        msg_lines.append("\n<b>By league</b>:")
+        for lg, st in sorted(s["leagues"].items(),
+                             key=lambda kv: kv[1]["pnl"], reverse=True):
+            wr = (st["wins"] / st["n"] * 100) if st["n"] else 0.0
+            msg_lines.append(
+                f"  {lg or '?'}: {st['n']} bets, "
+                f"<b>£{st['pnl']:+.2f}</b>  ({wr:.0f}% WR)"
+            )
+    if s["first_ts"] and s["last_ts"]:
+        msg_lines.append(
+            f"\nspan: {s['first_ts'][:10]} → {s['last_ts'][:10]}"
+        )
+    await update.message.reply_text("\n".join(msg_lines), parse_mode=ParseMode.HTML)
 
 
 async def _cmd_xg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
