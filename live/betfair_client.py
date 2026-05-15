@@ -99,26 +99,39 @@ class BetfairLive:
                 "Betfair credentials missing in config.py: " + ", ".join(missing)
                 + ".\nDid you forget to save the file?"
             )
+        # Cert-based login is required when running from a datacenter IP
+        # (Betfair 403s the interactive login endpoint from cloud ranges).
+        # If BETFAIR_CERTS_PATH is set to a directory containing
+        # client-2048.crt + client-2048.key, we use cert login; otherwise we
+        # fall back to interactive (fine for residential / dev machines).
+        certs_path = (getattr(config, "BETFAIR_CERTS_PATH", "") or "").strip()
+        self._certs_path: str | None = certs_path or None
+        self._uses_cert = bool(self._certs_path)
         self._client = bflw.APIClient(
             username=creds["BETFAIR_USERNAME"],
             password=creds["BETFAIR_PASSWORD"],
             app_key=creds["BETFAIR_APP_KEY"],
+            certs=self._certs_path,
         )
         self._logged_in = False
         self._login_at: float = 0.0
-        # Betfair interactive sessions expire after ~4h idle / 8h max. Refresh
-        # well before either limit fires.
+        # Betfair sessions expire after ~4h idle / 8h max. Refresh well before
+        # either limit fires.
         self._session_max_age_s = 3 * 3600
 
     # ------------------------------------------------------------------ session
     def login(self) -> None:
         if self._logged_in and self._login_age_s() < self._session_max_age_s:
             return
-        # Interactive login (email/pass) — no client cert required.
-        self._client.login_interactive()
+        if self._uses_cert:
+            self._client.login()
+            mode = "cert"
+        else:
+            self._client.login_interactive()
+            mode = "interactive"
         self._logged_in = True
         self._login_at = _time.time()
-        logger.info("Betfair: logged in as %s", config.BETFAIR_USERNAME)
+        logger.info("Betfair: logged in as %s (%s mode)", config.BETFAIR_USERNAME, mode)
 
     def logout(self) -> None:
         if not self._logged_in:

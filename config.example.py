@@ -7,6 +7,11 @@ config.py is gitignored — never commit real credentials.
 BETFAIR_USERNAME = ""
 BETFAIR_PASSWORD = ""
 BETFAIR_APP_KEY = ""
+# Path to a directory containing client-2048.crt + client-2048.key. Required
+# only when running from a datacenter IP (Hetzner, AWS etc.) since Betfair
+# 403s the interactive login from cloud ranges. Leave empty on a residential
+# IP to use interactive (username/password) login.
+BETFAIR_CERTS_PATH = ""
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
 
