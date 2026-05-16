@@ -500,28 +500,63 @@ async def _on_watch(event_id: int, *, silent: bool = False) -> None:
 
 
 async def _auto_discover_loop() -> None:
-    """Background task: every N seconds, find live + soon-starting matches in
-    LIVE_STRATEGY_BY_LEAGUE and watch any not already in STATE.monitors."""
+    """Bandwidth-aware auto-discover.
+
+    The SofaScore endpoints we hit go through the metered residential proxy,
+    so we adaptively widen the interval when nothing is imminent:
+
+      - if any match is in-progress OR kicks off within 60 min: poll every
+        LIVE_AUTO_DISCOVER_INTERVAL_S (default 60 s)
+      - else if next match is within LIVE_AUTO_DISCOVER_LOOKAHEAD_H hours:
+        poll every LIVE_AUTO_DISCOVER_IDLE_INTERVAL_S (default 600 s)
+      - else (no fixtures within lookahead): cap-and-cache for
+        LIVE_AUTO_DISCOVER_IDLE_INTERVAL_S × 3 (default 30 min)
+
+    We also skip the "tomorrow" fixture fetch during normal hours and only
+    pull it after 20:00 UTC (when today's fixtures are wrapping up).
+    """
     lookahead_s = config.LIVE_AUTO_DISCOVER_LOOKAHEAD_H * 3600
+    active_interval = config.LIVE_AUTO_DISCOVER_INTERVAL_S
+    idle_interval = getattr(config, "LIVE_AUTO_DISCOVER_IDLE_INTERVAL_S", 600)
     target_leagues = set(getattr(config, "LIVE_STRATEGY_BY_LEAGUE", {}).keys())
     if not target_leagues:
-        logger.warning("auto-discover: no leagues in LIVE_STRATEGY_BY_LEAGUE; loop will idle")
+        logger.warning("auto-discover: no leagues mapped; loop will idle")
     handle = STATE.bot_handle
     seen_announce: set[int] = set()
+
+    # Cache: avoid refetching scheduled_events when nothing changed.
+    cached_today: list[dict] | None = None
+    cached_today_at: float = 0.0
+    cache_ttl = 1800  # 30 min — fixture list rarely changes intraday
+
     while True:
         try:
+            now = time.time()
             sofa = SofaScore()
             try:
-                today_evs = await asyncio.to_thread(sofa.scheduled_events, date.today())
-                tomorrow_evs = await asyncio.to_thread(
-                    sofa.scheduled_events, date.today() + timedelta(days=1),
-                )
+                # Refresh today's fixtures from cache or wire.
+                if cached_today is None or (now - cached_today_at) > cache_ttl:
+                    cached_today = await asyncio.to_thread(
+                        sofa.scheduled_events, date.today(),
+                    )
+                    cached_today_at = now
+                today_evs = cached_today
+                # Only fetch tomorrow's late in the day (avoids doubling the
+                # call count for ~22h/day when it's irrelevant).
+                current_utc_hour = datetime.now(timezone.utc).hour
+                if current_utc_hour >= 20:
+                    tomorrow_evs = await asyncio.to_thread(
+                        sofa.scheduled_events, date.today() + timedelta(days=1),
+                    )
+                else:
+                    tomorrow_evs = []
                 live_evs = await asyncio.to_thread(sofa.live_events)
             finally:
                 sofa.close()
 
-            now = time.time()
             relevant: dict[int, dict] = {}
+            next_ko_secs: float | None = None
+            any_inprogress = False
             for ev in (today_evs + tomorrow_evs + live_evs):
                 tid = (
                     (ev.get("tournament", {}) or {}).get("uniqueTournament", {}) or {}
@@ -534,10 +569,14 @@ async def _auto_discover_loop() -> None:
                 eid = ev["id"]
                 if status == "inprogress":
                     relevant[eid] = ev
+                    any_inprogress = True
                     continue
                 ko = ev.get("startTimestamp") or 0
                 if ko and 0 < ko - now <= lookahead_s:
                     relevant[eid] = ev
+                    secs_to_ko = ko - now
+                    if next_ko_secs is None or secs_to_ko < next_ko_secs:
+                        next_ko_secs = secs_to_ko
 
             for eid, ev in relevant.items():
                 if eid in STATE.monitors:
@@ -560,9 +599,18 @@ async def _auto_discover_loop() -> None:
                     )
                     seen_announce.add(eid)
                 await _on_watch(eid, silent=True)
+
+            # Adaptive cadence: tight when matches imminent, loose otherwise.
+            if any_inprogress or (next_ko_secs is not None and next_ko_secs <= 3600):
+                sleep_for = active_interval
+            elif next_ko_secs is not None and next_ko_secs <= lookahead_s:
+                sleep_for = idle_interval        # match within 1-3h
+            else:
+                sleep_for = idle_interval * 3    # nothing within lookahead
         except Exception as exc:  # noqa: BLE001
             logger.warning("auto-discover loop failed: %s", exc)
-        await asyncio.sleep(config.LIVE_AUTO_DISCOVER_INTERVAL_S)
+            sleep_for = active_interval  # retry sooner on failure
+        await asyncio.sleep(sleep_for)
 
 
 async def _on_stop(event_id: int | None = None) -> None:

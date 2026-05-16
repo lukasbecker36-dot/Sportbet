@@ -82,7 +82,8 @@ LIVE_BASE_WIN_RATE = 0.57
 # matches in any league in LIVE_STRATEGY_BY_LEAGUE and starts a monitor for
 # each. You can still /watch <event_id> manually for matches outside this set.
 LIVE_AUTO_DISCOVER = True
-LIVE_AUTO_DISCOVER_INTERVAL_S = 60      # how often to scan
+LIVE_AUTO_DISCOVER_INTERVAL_S = 60      # tight scan cadence near kickoffs / live
+LIVE_AUTO_DISCOVER_IDLE_INTERVAL_S = 600 # slower when nothing imminent (proxy saver)
 LIVE_AUTO_DISCOVER_LOOKAHEAD_H = 3      # also watch fixtures starting in next N hours
 
 # Per-league strategies — each league can list multiple strategies. The
@@ -133,7 +134,7 @@ LIVE_STAKE_GBP = 10.0           # flat per trade
 LIVE_MAX_STAKE_GBP = 10.0       # hard cap; placement aborts if exceeded
 LIVE_DAILY_STAKE_CAP_GBP = 60.0 # 6 x £10 trades across all matches/strategies
 LIVE_CONFIRM_TIMEOUT_S = 60     # manual mode: seconds before alert expires
-LIVE_POLL_SECONDS = 30
+LIVE_POLL_SECONDS = 60      # per-match poll while in-progress (was 30; 60 halves proxy use)
 
 # Hypothetical paper-trade stake used by the /pnl Telegram command.
 # Independent of LIVE_STAKE_GBP (which is the real placement stake) — this
