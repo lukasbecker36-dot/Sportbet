@@ -73,6 +73,30 @@ class RunnerState:
 STATE = RunnerState()
 
 
+async def _near_miss(strategy_idx: int, home: str, away: str,
+                     minute: int, rate: float, goals: int, line: float,
+                     *, reason: str) -> None:
+    """Tell Telegram when an xG signal fired but couldn't actually place.
+
+    Logged at WARNING so it surfaces in journalctl too.
+    """
+    logger.warning(
+        "near-miss [strat=%d] %s v %s min=%d xg=%.2f line=%.1f goals=%d: %s",
+        strategy_idx, home, away, minute, rate, line, goals, reason,
+    )
+    handle = STATE.bot_handle
+    if handle is None:
+        return
+    try:
+        await handle.send_text(
+            f"⚠ <b>{home} v {away}</b> — xG signal fired at min <b>{minute}'</b> "
+            f"(rate <b>{rate:.2f}</b>, score G={goals}, line=over_<b>{line}</b>)\n"
+            f"but blocked: <i>{reason}</i>",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("near-miss telegram send failed: %s", exc)
+
+
 def _settle_alerts_for_match(event_id: int, final_total: int) -> int:
     """Settle every fired alert for this match against the final score.
 
@@ -336,23 +360,36 @@ async def _monitor_match(event_id: int) -> None:
                 target_line = _resolve_line(kind, val, gt)
                 if target_line is None:
                     continue
+                # From here, the xG signal HAS fired. If anything downstream
+                # blocks the actual placement (no market / no price / EV too
+                # low), tell Telegram so silent failures stop being silent.
                 market = await _market_for(target_line, kickoff, home, away)
                 if market is None:
+                    await _near_miss(
+                        i, home, away, minute, rate, gt, target_line,
+                        reason=f"Betfair market for over_{target_line} not found "
+                               f"(team name mismatch?)",
+                    )
+                    fired.add(i)
                     continue
                 price_snap = await asyncio.to_thread(bf.fetch_price, market)
                 price = _best_price(price_snap)
                 if price is None:
-                    logger.info(
-                        "min=%d xg=%.2f line=%.1f: no Betfair price (status=%s)",
-                        minute, rate, target_line, price_snap.status,
+                    await _near_miss(
+                        i, home, away, minute, rate, gt, target_line,
+                        reason=f"Betfair price unavailable (market status="
+                               f"{price_snap.status})",
                     )
+                    fired.add(i)
                     continue
                 ev_value = expected_value(price, wr)
                 if ev_value < config.LIVE_MIN_EV:
-                    logger.info(
-                        "min=%d xg=%.2f line=%.1f LTP=%.2f EV=%.3f below floor",
-                        minute, rate, target_line, price, ev_value,
+                    await _near_miss(
+                        i, home, away, minute, rate, gt, target_line,
+                        reason=f"LTP {price:.2f} gives EV {ev_value:+.3f} (floor "
+                               f"{config.LIVE_MIN_EV:+.2f})",
                     )
+                    fired.add(i)
                     continue
                 await _push_alert(
                     event_id, market, home, away,

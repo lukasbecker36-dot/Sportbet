@@ -208,8 +208,12 @@ class BetfairLive:
             max_results=200,
         )
 
-        wanted_home = _normalise(home)
-        wanted_away = _normalise(away)
+        wanted_home = _normalise(_sofascore_to_betfair(home))
+        wanted_away = _normalise(_sofascore_to_betfair(away))
+        # Also try fully-normalised SofaScore names (without translation) as a
+        # fallback — covers teams where SofaScore == Betfair after accent strip.
+        wanted_home_raw = _normalise(home)
+        wanted_away_raw = _normalise(away)
         for m in catalogue:
             ev = m.event
             ev_name = (ev.name or "")
@@ -217,7 +221,10 @@ class BetfairLive:
             if len(parts) != 2:
                 continue
             h, a = _normalise(parts[0]), _normalise(parts[1])
-            if h != wanted_home or a != wanted_away:
+            if (h, a) not in {
+                (wanted_home, wanted_away),
+                (wanted_home_raw, wanted_away_raw),
+            }:
                 continue
             # Find the "Over N.5 Goals" runner
             over_sel_id = None
@@ -337,6 +344,84 @@ class BetfairLive:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+# SofaScore returns club names in their official form ("FC Bayern München",
+# "Bayer 04 Leverkusen", "1. FC Heidenheim 1846"…). Betfair uses shorter,
+# more colloquial labels. The normaliser below strips accents and lowercases
+# but doesn't bridge those vocabulary differences, so each find-market call
+# would silently 0-match on Bundesliga/La Liga/Serie A/etc.
+#
+# Map SofaScore canonical → Betfair canonical. Apply BEFORE _normalise.
+SOFASCORE_TO_BETFAIR: dict[str, str] = {
+    # PL
+    "Nottingham Forest": "Nottm Forest",
+    # Bundesliga
+    "FC Bayern München": "Bayern Munich",
+    "Bayer 04 Leverkusen": "Leverkusen",
+    "Borussia M'gladbach": "Mönchengladbach",
+    "Borussia Mönchengladbach": "Mönchengladbach",
+    "1. FC Heidenheim 1846": "Heidenheim",
+    "1. FC Heidenheim": "Heidenheim",
+    "1. FC Köln": "FC Köln",
+    "1. FC Union Berlin": "Union Berlin",
+    "1. FSV Mainz 05": "Mainz",
+    "FC St. Pauli": "St Pauli",
+    "SV Werder Bremen": "Werder Bremen",
+    "VfL Wolfsburg": "Wolfsburg",
+    "VfB Stuttgart": "Stuttgart",
+    "FC Augsburg": "Augsburg",
+    "TSG Hoffenheim": "Hoffenheim",
+    "Eintracht Frankfurt": "E Frankfurt",
+    "SC Freiburg": "Freiburg",
+    "RB Leipzig": "RB Leipzig",
+    "Hamburger SV": "Hamburg",
+    "Holstein Kiel": "Kiel",
+    # La Liga
+    "Atlético Madrid": "Atletico Madrid",
+    "Athletic Club": "Athletic Bilbao",
+    "Real Betis": "Betis",
+    "Real Sociedad": "Sociedad",
+    "Rayo Vallecano": "R Vallecano",
+    "Real Madrid": "R Madrid",
+    "Cádiz": "Cadiz",
+    "Almería": "Almeria",
+    "Alavés": "Alaves",
+    "Deportivo Alavés": "Alaves",
+    "RCD Mallorca": "Mallorca",
+    "UD Las Palmas": "Las Palmas",
+    "Celta de Vigo": "Celta Vigo",
+    # Serie A
+    "Internazionale": "Inter Milan",
+    "Inter": "Inter Milan",
+    "AS Roma": "Roma",
+    "Hellas Verona": "Verona",
+    "Como 1907": "Como",
+    # Ligue 1
+    "Paris Saint-Germain": "Paris SG",
+    "Olympique Marseille": "Marseille",
+    "Olympique Lyonnais": "Lyon",
+    "Stade Rennais": "Rennes",
+    "OGC Nice": "Nice",
+    "Stade Brestois 29": "Brest",
+    "RC Strasbourg Alsace": "Strasbourg",
+    "RC Lens": "Lens",
+    "FC Nantes": "Nantes",
+    "LOSC Lille": "Lille",
+    "Stade de Reims": "Reims",
+    "FC Metz": "Metz",
+    "Le Havre AC": "Le Havre",
+    "AJ Auxerre": "Auxerre",
+    "Angers SCO": "Angers",
+    "AS Saint-Étienne": "St Etienne",
+    "Saint-Étienne": "St Etienne",
+}
+
+
+def _sofascore_to_betfair(name: str) -> str:
+    """Translate a SofaScore club name to its Betfair equivalent before
+    normalisation. Pass-through for unmapped names."""
+    return SOFASCORE_TO_BETFAIR.get((name or "").strip(), name)
+
+
 def _normalise(s: str) -> str:
     import unicodedata
     s = unicodedata.normalize("NFKD", s)
