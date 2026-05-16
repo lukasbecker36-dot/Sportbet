@@ -290,6 +290,17 @@ async def _monitor_match(event_id: int) -> None:
                 await asyncio.sleep(sleep_for)
                 continue
 
+            # Skip the heavy shotmap fetch once all strategies have fired —
+            # we only need to know when the match ends, which the event meta
+            # already tells us. Loose-poll until status flips to "finished".
+            if len(fired) >= len(strategies) and strategies:
+                slot["last_tick"] = (
+                    f"{_match_minute(ev) or '?'}'  awaiting FT  "
+                    f"({len(fired)} signal{'s' if len(fired) != 1 else ''} fired)"
+                )
+                await asyncio.sleep(max(config.LIVE_POLL_SECONDS, 180))
+                continue
+
             try:
                 raw_shots = await asyncio.to_thread(sofa.shotmap, event_id)
             except Exception as exc:  # noqa: BLE001
@@ -527,7 +538,7 @@ async def _auto_discover_loop() -> None:
     # Cache: avoid refetching scheduled_events when nothing changed.
     cached_today: list[dict] | None = None
     cached_today_at: float = 0.0
-    cache_ttl = 1800  # 30 min — fixture list rarely changes intraday
+    cache_ttl = 4 * 3600  # 4 h — fixture list barely changes intraday
 
     while True:
         try:
@@ -550,14 +561,17 @@ async def _auto_discover_loop() -> None:
                     )
                 else:
                     tomorrow_evs = []
-                live_evs = await asyncio.to_thread(sofa.live_events)
+                # NOTE: We do NOT call /events/live here. The scheduled_events
+                # payload already contains every fixture's current status, so
+                # the global-live feed is redundant — and it's expensive
+                # (returns every live football match worldwide).
             finally:
                 sofa.close()
 
             relevant: dict[int, dict] = {}
             next_ko_secs: float | None = None
             any_inprogress = False
-            for ev in (today_evs + tomorrow_evs + live_evs):
+            for ev in (today_evs + tomorrow_evs):
                 tid = (
                     (ev.get("tournament", {}) or {}).get("uniqueTournament", {}) or {}
                 ).get("id")
