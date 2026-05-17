@@ -73,17 +73,36 @@ class RunnerState:
 STATE = RunnerState()
 
 
-async def _near_miss(strategy_idx: int, home: str, away: str,
+async def _near_miss(strategy_idx: int, event_id: int, league: str,
+                     home: str, away: str,
                      minute: int, rate: float, goals: int, line: float,
-                     *, reason: str) -> None:
-    """Tell Telegram when an xG signal fired but couldn't actually place.
+                     score: str, *, reason: str) -> None:
+    """Record + announce an xG signal that fired but couldn't actually place.
 
-    Logged at WARNING so it surfaces in journalctl too.
+    Adds an entry to STATE.recent_alerts marked as ``blocked`` so /recent
+    surfaces it, sends a Telegram message, and logs at WARNING.
     """
     logger.warning(
         "near-miss [strat=%d] %s v %s min=%d xg=%.2f line=%.1f goals=%d: %s",
         strategy_idx, home, away, minute, rate, line, goals, reason,
     )
+    STATE.recent_alerts.appendleft({
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "event_id": event_id,
+        "league": league,
+        "home": home, "away": away,
+        "minute": minute, "score": score,
+        "xg_rate": rate,
+        "market": f"over_{line}",
+        "market_line": line,
+        "price": None,  # not fetched; blocked
+        "ev": None,
+        "mode": "blocked",
+        "blocked_reason": reason,
+        # Blocked signals aren't settled — no price means no paper P&L.
+        "settled": False, "won": None, "final_total": None,
+        "paper_profit_gbp": None,
+    })
     handle = STATE.bot_handle
     if handle is None:
         return
@@ -366,9 +385,10 @@ async def _monitor_match(event_id: int) -> None:
                 market = await _market_for(target_line, kickoff, home, away)
                 if market is None:
                     await _near_miss(
-                        i, home, away, minute, rate, gt, target_line,
+                        i, event_id, tournament_name, home, away,
+                        minute, rate, gt, target_line, score,
                         reason=f"Betfair market for over_{target_line} not found "
-                               f"(team name mismatch?)",
+                               f"(team name mismatch? use /debug {event_id})",
                     )
                     fired.add(i)
                     continue
@@ -376,7 +396,8 @@ async def _monitor_match(event_id: int) -> None:
                 price = _best_price(price_snap)
                 if price is None:
                     await _near_miss(
-                        i, home, away, minute, rate, gt, target_line,
+                        i, event_id, tournament_name, home, away,
+                        minute, rate, gt, target_line, score,
                         reason=f"Betfair price unavailable (market status="
                                f"{price_snap.status})",
                     )
@@ -385,7 +406,8 @@ async def _monitor_match(event_id: int) -> None:
                 ev_value = expected_value(price, wr)
                 if ev_value < config.LIVE_MIN_EV:
                     await _near_miss(
-                        i, home, away, minute, rate, gt, target_line,
+                        i, event_id, tournament_name, home, away,
+                        minute, rate, gt, target_line, score,
                         reason=f"LTP {price:.2f} gives EV {ev_value:+.3f} (floor "
                                f"{config.LIVE_MIN_EV:+.2f})",
                     )

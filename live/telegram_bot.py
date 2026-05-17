@@ -190,8 +190,9 @@ _HELP_TEXT = (
     "/help — show this list\n"
     "/status — list matches currently being watched\n"
     "/pnl — paper P&L if you'd flat-staked every signal\n"
-    "/recent — last 10 fired signals with ✅/❌/⏳ markers\n"
+    "/recent — last 10 fired signals (✅ won / ❌ lost / ⏳ pending / ⚠ blocked)\n"
     "/xg <code>&lt;event_id&gt;</code> — current xG rate + score for a live match\n"
+    "/debug <code>&lt;event_id&gt;</code> — show how Betfair names this fixture (for blocked-signal diagnosis)\n"
     "/watch <code>&lt;event_id&gt;</code> — manually add a match (auto-discovery covers Big 5)\n"
     "/stop <code>[event_id]</code> — stop one monitor (or all if no id)\n"
     "/funds — show Betfair balance (needs Account API perm on app key)\n"
@@ -215,6 +216,8 @@ async def _cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _outcome_marker(a: dict) -> str:
+    if a.get("mode") == "blocked":
+        return "⚠"
     if not a.get("settled"):
         return "⏳"  # pending
     return "✅" if a.get("won") else "❌"
@@ -231,18 +234,112 @@ async def _cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for a in alerts[:10]:
         ts = a["ts"].replace("T", " ").replace("+00:00", "Z")
         marker = _outcome_marker(a)
+        is_blocked = a.get("mode") == "blocked"
         tail = ""
         if a.get("settled"):
             ft = a.get("final_total")
             pp = a.get("paper_profit_gbp")
             tail = f"  FT total={ft}  paper £{pp:+.2f}"
+        elif is_blocked:
+            tail = f"  blocked: {a.get('blocked_reason', '?')}"
+        price_str = (
+            f"@<b>{a['price']:.2f}</b>" if a.get("price") is not None else ""
+        )
+        ev_str = (
+            f"  EV <b>{a['ev']:+.2f}</b>" if a.get("ev") is not None else ""
+        )
         lines.append(
             f"{marker} {ts}  {a['home']} v {a['away']}\n"
             f"   min {a['minute']}'  score {a['score']}  "
             f"xG15 <b>{a['xg_rate']:.2f}</b>  "
-            f"{a['market']}@<b>{a['price']:.2f}</b>  "
-            f"EV <b>{a['ev']:+.2f}</b>{tail}"
+            f"{a['market']}{price_str}{ev_str}{tail}"
         )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def _cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inspect Betfair's view of a fixture: what eventName + over markets exist."""
+    if not _is_authorised(update):
+        return
+    parts = (update.message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await update.message.reply_text("Usage: /debug <event_id>")
+        return
+    event_id = int(parts[1])
+
+    import asyncio
+    from datetime import datetime, timezone, timedelta
+    from live.sofascore import SofaScore
+
+    bf = ctx.application.bot_data.get("betfair")
+    if bf is None:
+        await update.message.reply_text("Betfair client not initialised.")
+        return
+
+    # Pull home/away/kickoff from SofaScore so we can search Betfair correctly.
+    try:
+        sofa = SofaScore()
+        try:
+            ev = await asyncio.to_thread(sofa.event, event_id)
+        finally:
+            sofa.close()
+    except Exception as e:  # noqa: BLE001
+        await update.message.reply_text(f"SofaScore fetch error: {e}")
+        return
+    home = ev.get("homeTeam", {}).get("name", "?")
+    away = ev.get("awayTeam", {}).get("name", "?")
+    ko_ts = ev.get("startTimestamp")
+    kickoff = (
+        datetime.fromtimestamp(ko_ts, tz=timezone.utc) if ko_ts else
+        datetime.now(timezone.utc)
+    )
+
+    # Query Betfair catalogue for ALL over-goals markets in the time window
+    # (we don't filter by team-name here — we want to see what Betfair calls
+    # this fixture so the user can spot the mismatch).
+    import betfairlightweight as bflw  # noqa: F401
+    from betfairlightweight import filters
+    try:
+        catalogue = await asyncio.to_thread(
+            bf._retry_on_session,
+            bf._client.betting.list_market_catalogue,
+            filter=filters.market_filter(
+                event_type_ids=["1"],
+                market_type_codes=[
+                    "OVER_UNDER_05", "OVER_UNDER_15",
+                    "OVER_UNDER_25", "OVER_UNDER_35",
+                ],
+                market_start_time={
+                    "from": (kickoff - timedelta(hours=12)).isoformat(),
+                    "to": (kickoff + timedelta(hours=12)).isoformat(),
+                },
+            ),
+            market_projection=["EVENT", "MARKET_START_TIME"],
+            max_results=200,
+        )
+    except Exception as e:  # noqa: BLE001
+        await update.message.reply_text(f"Betfair catalogue error: {e}")
+        return
+
+    # Filter to events whose name contains either team's surname-ish token.
+    def _bag(s: str) -> set[str]:
+        return {t.lower() for t in s.split() if len(t) >= 3}
+    target_bag = _bag(home) | _bag(away)
+    relevant = []
+    for m in catalogue:
+        ev_name = (m.event.name or "")
+        if any(t in ev_name.lower() for t in target_bag):
+            relevant.append((ev_name, m.market_name, m.market_id))
+
+    lines = [
+        f"<b>SofaScore</b>: {home} v {away}  (ko {kickoff.isoformat(timespec='minutes')}Z)",
+        f"<b>Betfair catalogue</b> ({len(catalogue)} markets scanned, "
+        f"{len(relevant)} look related):",
+    ]
+    if not relevant:
+        lines.append("  (no matches — Betfair may use very different team names)")
+    for ev_name, market_name, mid in relevant[:20]:
+        lines.append(f"  • <b>{ev_name}</b>  ·  {market_name}  ·  id {mid}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -475,6 +572,7 @@ async def build_application(
     app.add_handler(CommandHandler("pnl", _cmd_pnl))
     app.add_handler(CommandHandler("recent", _cmd_recent))
     app.add_handler(CommandHandler("xg", _cmd_xg))
+    app.add_handler(CommandHandler("debug", _cmd_debug))
     app.add_handler(CommandHandler("funds", _cmd_funds))
     app.add_handler(CommandHandler("kill", _cmd_kill))
     app.add_handler(CallbackQueryHandler(_on_callback))
