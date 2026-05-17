@@ -600,11 +600,15 @@ async def build_application(
             event_id: int | None = None
             if len(parts) >= 2 and parts[1].isdigit():
                 event_id = int(parts[1])
-            await on_stop(event_id)
-            await update.message.reply_text(
-                f"Stopped monitor for {event_id}." if event_id is not None
-                else "Stopped all monitors.",
-            )
+            ok = await on_stop(event_id)
+            if event_id is not None:
+                msg = (
+                    f"Stopped monitor for {event_id}." if ok
+                    else f"Not currently watching event {event_id}."
+                )
+            else:
+                msg = "Stopped all monitors." if ok else "No active monitors to stop."
+            await update.message.reply_text(msg)
         app.add_handler(CommandHandler("stop", _cmd_stop))
 
     return app, handle

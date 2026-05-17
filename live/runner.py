@@ -68,6 +68,10 @@ class RunnerState:
         self.daily_staked: float = 0.0
         # Recent fired alerts, newest-first. Reused by /recent.
         self.recent_alerts: deque[dict] = deque(maxlen=25)
+        # event_id -> unix_ts_when_finished. Auto-discover skips events in
+        # this set for RECENTLY_ENDED_TTL seconds so a finished match isn't
+        # re-spawned by stale scheduled_events cache entries.
+        self.recently_ended: dict[int, float] = {}
 
 
 STATE = RunnerState()
@@ -497,6 +501,9 @@ async def _monitor_match(event_id: int) -> None:
     finally:
         sofa.close()
         STATE.monitors.pop(event_id, None)
+        # Mark this event as ended so auto-discover doesn't re-spawn it on
+        # stale-cache reads. TTL controlled in the loop below.
+        STATE.recently_ended[event_id] = time.time()
 
 
 def _best_price(snap: PriceSnapshot) -> float | None:
@@ -664,6 +671,8 @@ async def _auto_discover_loop() -> None:
     cached_today: list[dict] | None = None
     cached_today_at: float = 0.0
     cache_ttl = 4 * 3600  # 4 h — fixture list barely changes intraday
+    # How long to ignore a recently-finished event_id (overrides stale cache).
+    RECENTLY_ENDED_TTL = 12 * 3600
 
     while True:
         try:
@@ -693,6 +702,12 @@ async def _auto_discover_loop() -> None:
             finally:
                 sofa.close()
 
+            # Garbage-collect recently_ended entries past their TTL.
+            stale_keys = [eid for eid, ts in STATE.recently_ended.items()
+                          if now - ts > RECENTLY_ENDED_TTL]
+            for eid in stale_keys:
+                STATE.recently_ended.pop(eid, None)
+
             relevant: dict[int, dict] = {}
             next_ko_secs: float | None = None
             any_inprogress = False
@@ -702,10 +717,13 @@ async def _auto_discover_loop() -> None:
                 ).get("id")
                 if tid not in target_leagues:
                     continue
+                eid = ev["id"]
+                # Hard skip: this fixture just ended in another monitor task.
+                if eid in STATE.recently_ended:
+                    continue
                 status = (ev.get("status", {}) or {}).get("type")
                 if status in {"finished", "postponed", "canceled"}:
                     continue
-                eid = ev["id"]
                 if status == "inprogress":
                     relevant[eid] = ev
                     any_inprogress = True
@@ -752,17 +770,26 @@ async def _auto_discover_loop() -> None:
         await asyncio.sleep(sleep_for)
 
 
-async def _on_stop(event_id: int | None = None) -> None:
-    """Cancel one monitor (if event_id given) or all of them."""
-    targets = (
-        [(event_id, STATE.monitors[event_id])]
-        if event_id is not None and event_id in STATE.monitors
-        else list(STATE.monitors.items())
-    )
+async def _on_stop(event_id: int | None = None) -> bool:
+    """Cancel one monitor (if event_id given) or all of them.
+
+    Returns True if any monitors were cancelled. When event_id is given but
+    isn't in STATE.monitors, returns False without cancelling anything
+    (prevents accidental stop-all when /stop <wrong_id> is issued).
+    """
+    if event_id is not None:
+        if event_id not in STATE.monitors:
+            return False
+        targets = [(event_id, STATE.monitors[event_id])]
+    else:
+        targets = list(STATE.monitors.items())
+    cancelled = 0
     for _eid, slot in targets:
         task = slot.get("task")
         if task and not task.done():
             task.cancel()
+            cancelled += 1
+    return cancelled > 0
 
 
 # --------------------------------------------------------------------------- #
