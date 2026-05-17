@@ -145,6 +145,13 @@ PAPER_STAKE_GBP = 5.0
 # here so they survive bot restarts. Path relative to working directory.
 PAPER_TRADES_CSV = "data/paper_trades.csv"
 
+# Alert-only mode: skip all Betfair Betting API calls (market lookup, price
+# fetch, placement). When xG signal fires, send a Telegram alert with the
+# recommendation; user places manually via the Betfair app/website. Use this
+# when your Betfair app key lacks Betting API access (most Delayed keys).
+# Paper P&L uses an estimated odds derived from the strategy's win_rate.
+LIVE_ALERT_ONLY_MODE = False
+
 # Auto-place behaviour:
 #   "manual"         — Telegram message with [Place £10] / [Skip] buttons.
 #                      Nothing happens until you tap. Expires after

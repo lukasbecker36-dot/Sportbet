@@ -73,6 +73,57 @@ class RunnerState:
 STATE = RunnerState()
 
 
+async def _push_alert_only(
+    event_id: int, league: str, home: str, away: str,
+    minute: int, rate: float, goals: int, line: float, score: str,
+    win_rate: float,
+) -> None:
+    """Alert-only fire path: skips Betfair entirely.
+
+    Records the alert in STATE.recent_alerts with mode='alert_only' and a
+    heuristic 'price' so settlement / paper P&L still works. Sends a
+    Telegram message recommending the user back the bet manually on the
+    Betfair app/website.
+    """
+    # Heuristic price for paper P&L. Roughly: a fair-odds-with-edge estimate.
+    # 1/win_rate is the break-even price; real market prices are typically
+    # ~15% above break-even on these strategies. Floor at 1.10 to avoid
+    # division weirdness for very high WR strategies.
+    est_odds = max(1.10, min(20.0, (1.0 / max(win_rate, 0.05)) * 1.15))
+    handle = STATE.bot_handle
+    STATE.recent_alerts.appendleft({
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "event_id": event_id,
+        "league": league,
+        "home": home, "away": away,
+        "minute": minute, "score": score,
+        "xg_rate": rate,
+        "market": f"over_{line}",
+        "market_line": line,
+        "price": est_odds,
+        "ev": None,  # not gated on EV in alert-only mode
+        "mode": "alert_only",
+        "settled": False, "won": None, "final_total": None,
+        "paper_profit_gbp": None,
+    })
+    logger.info(
+        "alert-only fire: %s v %s min=%d xg=%.2f line=%.1f G=%d wr=%.2f est=%.2f",
+        home, away, minute, rate, line, goals, win_rate, est_odds,
+    )
+    if handle is None:
+        return
+    try:
+        await handle.send_text(
+            f"⚡ <b>SIGNAL — {home} v {away}</b>\n"
+            f"min <b>{minute}'</b>  score <b>{score}</b>  G={goals}\n"
+            f"xg_rate_15m=<b>{rate:.2f}</b>  win_rate=<b>{win_rate:.0%}</b>\n"
+            f"<b>BACK Over {line} Goals</b> on Betfair (manual)\n"
+            f"<i>(alert-only mode — est. odds ≈{est_odds:.2f} used for paper P&amp;L)</i>",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("alert-only telegram send failed: %s", exc)
+
+
 async def _near_miss(strategy_idx: int, event_id: int, league: str,
                      home: str, away: str,
                      minute: int, rate: float, goals: int, line: float,
@@ -369,6 +420,7 @@ async def _monitor_match(event_id: int) -> None:
             # at most once per match; different strategies can both fire on
             # the same fixture (they typically target different lines /
             # minutes, so the exposure is on separate Betfair markets).
+            alert_only = bool(getattr(config, "LIVE_ALERT_ONLY_MODE", False))
             for i, (thr, kind, val, mn, mx, wr) in enumerate(strategies):
                 if i in fired:
                     continue
@@ -379,6 +431,20 @@ async def _monitor_match(event_id: int) -> None:
                 target_line = _resolve_line(kind, val, gt)
                 if target_line is None:
                     continue
+
+                # Alert-only mode: skip every Betfair Betting API call (which
+                # are 403'd on read-only / delayed app keys) and fire a
+                # 'manual placement' alert instead. Paper P&L uses a rough
+                # estimated odds derived from the strategy's win_rate so /pnl
+                # still tracks meaningful numbers.
+                if alert_only:
+                    await _push_alert_only(
+                        event_id, tournament_name, home, away,
+                        minute, rate, gt, target_line, score, wr,
+                    )
+                    fired.add(i)
+                    continue
+
                 # From here, the xG signal HAS fired. If anything downstream
                 # blocks the actual placement (no market / no price / EV too
                 # low), tell Telegram so silent failures stop being silent.
@@ -753,11 +819,21 @@ async def _amain() -> None:
     await app.updater.start_polling()
     logger.info("Telegram polling started; awaiting commands…")
     auto = "ON" if getattr(config, "LIVE_AUTO_DISCOVER", False) else "OFF"
+    alert_only = getattr(config, "LIVE_ALERT_ONLY_MODE", False)
+    if alert_only:
+        intro_tail = (
+            f"<b>alert-only mode</b> (no Betfair calls; manual placement)\n"
+            f"paper stake £{getattr(config, 'PAPER_STAKE_GBP', 5):.0f}"
+        )
+    else:
+        intro_tail = (
+            f"stake £{config.LIVE_STAKE_GBP:.0f}, EV floor {config.LIVE_MIN_EV:+.2f}, "
+            f"daily cap £{config.LIVE_DAILY_STAKE_CAP_GBP:.0f}"
+        )
     await handle.send_text(
         f"🟢 Live monitor online. Auto-discover: <b>{auto}</b>\n"
-        f"leagues: {len(getattr(config, 'LIVE_STRATEGY_BY_LEAGUE', {}))} "
-        f"(stake £{config.LIVE_STAKE_GBP:.0f}, EV floor {config.LIVE_MIN_EV:+.2f}, "
-        f"daily cap £{config.LIVE_DAILY_STAKE_CAP_GBP:.0f})",
+        f"leagues: {len(getattr(config, 'LIVE_STRATEGY_BY_LEAGUE', {}))}  "
+        + intro_tail,
     )
 
     # 5. Block until cancelled (Ctrl-C)
