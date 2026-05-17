@@ -23,7 +23,9 @@ import time as _time
 
 import betfairlightweight as bflw
 from betfairlightweight import filters
-from betfairlightweight.exceptions import APIError, BetfairError
+from betfairlightweight.exceptions import (
+    APIError, BetfairError, StatusCodeError,
+)
 
 import config
 
@@ -152,7 +154,8 @@ class BetfairLive:
             self.login()
 
     def _retry_on_session(self, fn, *args, **kwargs):
-        """Run ``fn``; on session-related APIError, re-login once and retry."""
+        """Run ``fn``; on session-related error (APIError text or HTTP 401/403),
+        re-login once and retry."""
         self._ensure_session()
         try:
             return fn(*args, **kwargs)
@@ -163,6 +166,20 @@ class BetfairLive:
                 "SESSION_EXPIRED",
             )):
                 logger.warning("Betfair session expired (%s); re-logging in.", e)
+                self._logged_in = False
+                self.login()
+                return fn(*args, **kwargs)
+            raise
+        except StatusCodeError as e:
+            # 401/403 from a betting API call almost always means the session
+            # token went stale (Betfair returns 401/403 rather than a JSON
+            # error body in some cases). Try one re-login and retry.
+            code = getattr(e, "status_code", None) or str(e)
+            if "401" in str(code) or "403" in str(code):
+                logger.warning(
+                    "Betfair HTTP %s on betting call; re-logging in and retrying once.",
+                    code,
+                )
                 self._logged_in = False
                 self.login()
                 return fn(*args, **kwargs)

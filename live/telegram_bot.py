@@ -294,32 +294,32 @@ async def _cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         datetime.now(timezone.utc)
     )
 
-    # Query Betfair catalogue for ALL over-goals markets in the time window
-    # (we don't filter by team-name here — we want to see what Betfair calls
-    # this fixture so the user can spot the mismatch).
-    import betfairlightweight as bflw  # noqa: F401
+    # Query Betfair catalogue for over-goals markets one market_type at a
+    # time (some Betfair app key configurations 403 on multi-type queries).
     from betfairlightweight import filters
-    try:
-        catalogue = await asyncio.to_thread(
-            bf._retry_on_session,
-            bf._client.betting.list_market_catalogue,
-            filter=filters.market_filter(
-                event_type_ids=["1"],
-                market_type_codes=[
-                    "OVER_UNDER_05", "OVER_UNDER_15",
-                    "OVER_UNDER_25", "OVER_UNDER_35",
-                ],
-                market_start_time={
-                    "from": (kickoff - timedelta(hours=12)).isoformat(),
-                    "to": (kickoff + timedelta(hours=12)).isoformat(),
-                },
-            ),
-            market_projection=["EVENT", "MARKET_START_TIME"],
-            max_results=200,
-        )
-    except Exception as e:  # noqa: BLE001
-        await update.message.reply_text(f"Betfair catalogue error: {e}")
-        return
+    catalogue = []
+    failures: list[str] = []
+    for mtype in (
+        "OVER_UNDER_05", "OVER_UNDER_15", "OVER_UNDER_25", "OVER_UNDER_35",
+    ):
+        try:
+            part = await asyncio.to_thread(
+                bf._retry_on_session,
+                bf._client.betting.list_market_catalogue,
+                filter=filters.market_filter(
+                    event_type_ids=["1"],
+                    market_type_codes=[mtype],
+                    market_start_time={
+                        "from": (kickoff - timedelta(hours=12)).isoformat(),
+                        "to": (kickoff + timedelta(hours=12)).isoformat(),
+                    },
+                ),
+                market_projection=["EVENT", "MARKET_START_TIME"],
+                max_results=100,
+            )
+            catalogue.extend(part)
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"{mtype}: {e}")
 
     # Filter to events whose name contains either team's surname-ish token.
     def _bag(s: str) -> set[str]:
@@ -340,6 +340,10 @@ async def _cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("  (no matches — Betfair may use very different team names)")
     for ev_name, market_name, mid in relevant[:20]:
         lines.append(f"  • <b>{ev_name}</b>  ·  {market_name}  ·  id {mid}")
+    if failures:
+        lines.append("\n<b>Errors</b>:")
+        for f_ in failures:
+            lines.append(f"  • {f_}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
