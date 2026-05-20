@@ -117,7 +117,7 @@ async def _push_alert_only(
     if handle is None:
         return
     try:
-        await handle.send_text(
+        await handle.send_signal(
             f"⚡ <b>SIGNAL — {home} v {away}</b>\n"
             f"min <b>{minute}'</b>  score <b>{score}</b>  G={goals}\n"
             f"xg_rate_15m=<b>{rate:.2f}</b>  win_rate=<b>{win_rate:.0%}</b>\n"
@@ -577,14 +577,14 @@ async def _push_alert(
         try:
             result = await _place_bet(alert, market)
         except Exception as e:  # noqa: BLE001
-            await handle.send_text(
+            await handle.send_signal(
                 f"⚡ SIGNAL fired but placement crashed: {e}",
                 html=False,
             )
             return
         alert.resolved = True
         alert.decision = "auto_placed"
-        await handle.send_text(
+        await handle.send_signal(
             handle._format_alert(alert) + tg._result_suffix(result, price),
         )
         return

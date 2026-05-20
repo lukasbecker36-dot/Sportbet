@@ -69,6 +69,36 @@ class BotHandle:
             parse_mode=ParseMode.HTML if html else None,
         )
 
+    async def send_signal(self, text: str, *, html: bool = True) -> None:
+        """Dual-send: main chat + signals chat (if configured + distinct).
+
+        Use this for signal-fire messages the user wants iPhone push
+        notifications for — they can mute the main chat and only allow
+        notifications on the signals chat.
+        """
+        # Send to main chat first (existing behaviour). A failure here is
+        # treated like send_text would — we still try the signals chat below.
+        try:
+            await self._app.bot.send_message(
+                chat_id=int(config.TELEGRAM_CHAT_ID),
+                text=text,
+                parse_mode=ParseMode.HTML if html else None,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("send_signal main-chat send failed: %s", e)
+
+        signals_id = (getattr(config, "TELEGRAM_SIGNALS_CHAT_ID", "") or "").strip()
+        if not signals_id or signals_id == str(config.TELEGRAM_CHAT_ID):
+            return
+        try:
+            await self._app.bot.send_message(
+                chat_id=int(signals_id),
+                text=text,
+                parse_mode=ParseMode.HTML if html else None,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("send_signal signals-chat send failed: %s", e)
+
     async def send_alert(
         self,
         alert: PendingAlert,
@@ -104,6 +134,20 @@ class BotHandle:
             parse_mode=ParseMode.HTML,
         )
         alert.message_id = msg.message_id
+
+        # Mirror a no-button copy to the dedicated signals chat (if any).
+        # Keeps the interactive buttons in the main chat, sends a simpler
+        # push-friendly notification to the iPhone via the signals chat.
+        signals_id = (getattr(config, "TELEGRAM_SIGNALS_CHAT_ID", "") or "").strip()
+        if signals_id and signals_id != str(config.TELEGRAM_CHAT_ID):
+            try:
+                await self._app.bot.send_message(
+                    chat_id=int(signals_id),
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("signals-chat mirror failed: %s", e)
 
         if alert.mode in ("manual", "cancel_window"):
             asyncio.create_task(self._expire_after(alert))

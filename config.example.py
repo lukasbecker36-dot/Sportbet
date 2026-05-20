@@ -14,6 +14,12 @@ BETFAIR_APP_KEY = ""
 BETFAIR_CERTS_PATH = ""
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
+# Optional: separate chat (channel or group) that receives ONLY signal-fired
+# alerts. Useful for iPhone notification routing — mute the main bot chat and
+# keep notifications on for this one. Leave blank to disable (all messages
+# stay in TELEGRAM_CHAT_ID). For a channel, add the bot as admin and use the
+# channel id (starts with -100).
+TELEGRAM_SIGNALS_CHAT_ID = ""
 
 # Optional residential proxy for SofaScore traffic ONLY. Required when running
 # on a datacenter IP (Hetzner/AWS/DigitalOcean) since Cloudflare 403s those
