@@ -420,6 +420,27 @@ async def _monitor_match(event_id: int) -> None:
                 f"{minute}'  {score}  xg15={rate:.2f}  shots={len(shots)}"
             )
 
+            # xG-less match guard. Some fixtures — relegation/promotion
+            # playoffs, lower-tier cups — get a shotmap from SofaScore but
+            # no xG model output: every shot comes back xg=None -> 0.0. Such
+            # a match can never cross the xG threshold, so polling it is
+            # futile and the alerts are misleading. Once past 30' with a real
+            # shot count and still exactly zero total xG, conclude the feed
+            # has no xG and stop the monitor. The finally-block marks the
+            # event recently_ended so auto-discover won't re-spawn it.
+            if minute >= 30 and len(shots) >= 6 and sum(s.xg for s in shots) == 0.0:
+                logger.warning(
+                    "event %s (%s v %s): %d shots but zero xG at %d' — "
+                    "SofaScore has no xG for this fixture; stopping monitor",
+                    event_id, home, away, len(shots), minute,
+                )
+                await handle.send_text(
+                    f"⚠ <b>{home} v {away}</b> — SofaScore has no xG data "
+                    f"for this match ({len(shots)} shots, all xG-less). "
+                    f"Signal can't run — stopping monitor."
+                )
+                return
+
             # Walk each strategy independently — no dedup. A strategy fires
             # at most once per match; different strategies can both fire on
             # the same fixture (they typically target different lines /
