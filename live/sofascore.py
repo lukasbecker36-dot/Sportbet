@@ -85,6 +85,50 @@ class SofaScore:
     def shotmap(self, event_id: int) -> list[dict]:
         return self._get(f"/event/{event_id}/shotmap").get("shotmap", [])
 
+    def overunder_odds(self, event_id: int, line: float) -> tuple[float | None, str]:
+        """Live decimal odds for the Over X.5 selection at the given line.
+
+        Returns (odds, status) where status is one of:
+          'ok'        — odds parsed; use them
+          'suspended' — market temporarily suspended (mid-goal etc.)
+          'missing'   — line not present in this event's odds
+          'error'     — fetch / parse failure
+
+        SofaScore shows aggregated bookmaker prices (overround ~5-7%),
+        so the equivalent Betfair Exchange odds will be ~5% higher.
+        """
+        try:
+            data = self._get(f"/event/{event_id}/odds/1/all")
+        except Exception:  # noqa: BLE001
+            return None, "error"
+        target = f"{line:g}"  # 2.5 -> '2.5', 1.5 -> '1.5'
+        for m in data.get("markets", []):
+            if (m.get("marketGroup") == "Match goals"
+                and str(m.get("choiceGroup", "")) == target
+                and m.get("marketPeriod") == "Full-time"):
+                if m.get("suspended"):
+                    return None, "suspended"
+                for c in m.get("choices", []):
+                    if c.get("name") == "Over":
+                        odds = _parse_fractional(c.get("fractionalValue", ""))
+                        return (odds, "ok") if odds is not None else (None, "error")
+                return None, "missing"
+        return None, "missing"
+
+
+def _parse_fractional(s: str) -> float | None:
+    """Convert a fractional-odds string like '8/15' to decimal (1.533)."""
+    if not s or "/" not in s:
+        return None
+    try:
+        num, den = s.split("/", 1)
+        den_f = float(den)
+        if den_f == 0:
+            return None
+        return 1.0 + float(num) / den_f
+    except (ValueError, TypeError):
+        return None
+
 
 def filter_pl(events: Iterable[dict]) -> list[dict]:
     return [

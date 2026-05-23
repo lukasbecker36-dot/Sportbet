@@ -81,6 +81,9 @@ async def _push_alert_only(
     event_id: int, league: str, home: str, away: str,
     minute: int, rate: float, goals: int, line: float, score: str,
     win_rate: float,
+    *,
+    sofa_odds: float | None = None,
+    odds_status: str = "skip",
 ) -> None:
     """Alert-only fire path: skips Betfair entirely.
 
@@ -116,13 +119,27 @@ async def _push_alert_only(
     )
     if handle is None:
         return
+    # Build an odds line — show SofaScore price + estimated Exchange odds
+    # (~5% higher, accounting for bookmaker overround). If the gate didn't
+    # find a usable price, say so explicitly.
+    if sofa_odds is not None and odds_status == "ok":
+        exch_est = sofa_odds * 1.05
+        odds_line = (f"SofaScore Over {line} = <b>{sofa_odds:.2f}</b>  "
+                     f"(Exchange ≈ {exch_est:.2f})")
+    elif odds_status == "suspended":
+        odds_line = "<i>SofaScore market suspended — check Exchange before backing</i>"
+    elif odds_status in ("missing", "error"):
+        odds_line = f"<i>SofaScore over_{line} odds unavailable</i>"
+    else:
+        odds_line = ""
     try:
         await handle.send_signal(
             f"⚡ <b>SIGNAL — {home} v {away}</b>\n"
             f"min <b>{minute}'</b>  score <b>{score}</b>  G={goals}\n"
             f"xg_rate_15m=<b>{rate:.2f}</b>  win_rate=<b>{win_rate:.0%}</b>\n"
             f"<b>BACK Over {line} Goals</b> on Betfair (manual)\n"
-            f"<i>(alert-only mode — est. odds ≈{est_odds:.2f} used for paper P&amp;L)</i>",
+            + (odds_line + "\n" if odds_line else "")
+            + f"<i>(alert-only mode — est. odds ≈{est_odds:.2f} used for paper P&amp;L)</i>",
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("alert-only telegram send failed: %s", exc)
@@ -463,9 +480,37 @@ async def _monitor_match(event_id: int) -> None:
                 # estimated odds derived from the strategy's win_rate so /pnl
                 # still tracks meaningful numbers.
                 if alert_only:
+                    # SofaScore odds gate — alert-only mode has no Betfair
+                    # Betting API access, so we use SofaScore's live
+                    # bookmaker odds (5% lower than Exchange) as a
+                    # conservative floor to block negative-EV fires.
+                    sofa_odds = None
+                    odds_status = "skip"
+                    floor = (getattr(config,
+                                     "LIVE_SOFASCORE_ODDS_FLOOR_BY_LEAGUE",
+                                     {}) or {}).get(tournament_id)
+                    if floor is not None:
+                        try:
+                            sofa_odds, odds_status = await asyncio.to_thread(
+                                sofa.overunder_odds, event_id, target_line,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("sofa odds fetch failed: %s", exc)
+                            sofa_odds, odds_status = None, "error"
+                        if odds_status == "ok" and sofa_odds < floor:
+                            await _near_miss(
+                                i, event_id, tournament_name, home, away,
+                                minute, rate, gt, target_line, score,
+                                reason=(f"SofaScore Over {target_line} odds "
+                                        f"{sofa_odds:.2f} < floor {floor:.2f} "
+                                        f"(Exchange ≈ {sofa_odds*1.05:.2f})"),
+                            )
+                            fired.add(i)
+                            continue
                     await _push_alert_only(
                         event_id, tournament_name, home, away,
                         minute, rate, gt, target_line, score, wr,
+                        sofa_odds=sofa_odds, odds_status=odds_status,
                     )
                     fired.add(i)
                     continue
