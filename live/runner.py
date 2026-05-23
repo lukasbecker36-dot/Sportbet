@@ -483,34 +483,52 @@ async def _monitor_match(event_id: int) -> None:
                     # SofaScore odds gate — alert-only mode has no Betfair
                     # Betting API access, so we use SofaScore's live
                     # bookmaker odds (5% lower than Exchange) as a
-                    # conservative floor to block negative-EV fires.
-                    sofa_odds = None
-                    odds_status = "skip"
+                    # conservative gate. Strict policy: only push an alert
+                    # when odds are confirmed above the league's floor.
+                    # Anything else (below floor, suspended mid-goal,
+                    # missing, fetch error) becomes a silent near-miss.
                     floor = (getattr(config,
                                      "LIVE_SOFASCORE_ODDS_FLOOR_BY_LEAGUE",
                                      {}) or {}).get(tournament_id)
-                    if floor is not None:
-                        try:
-                            sofa_odds, odds_status = await asyncio.to_thread(
-                                sofa.overunder_odds, event_id, target_line,
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            logger.warning("sofa odds fetch failed: %s", exc)
-                            sofa_odds, odds_status = None, "error"
-                        if odds_status == "ok" and sofa_odds < floor:
-                            await _near_miss(
-                                i, event_id, tournament_name, home, away,
-                                minute, rate, gt, target_line, score,
-                                reason=(f"SofaScore Over {target_line} odds "
-                                        f"{sofa_odds:.2f} < floor {floor:.2f} "
-                                        f"(Exchange ≈ {sofa_odds*1.05:.2f})"),
-                            )
-                            fired.add(i)
-                            continue
+                    if floor is None:
+                        # No floor configured for this league — fall back to
+                        # firing without the gate (back-compat behaviour).
+                        await _push_alert_only(
+                            event_id, tournament_name, home, away,
+                            minute, rate, gt, target_line, score, wr,
+                        )
+                        fired.add(i)
+                        continue
+                    try:
+                        sofa_odds, odds_status = await asyncio.to_thread(
+                            sofa.overunder_odds, event_id, target_line,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("sofa odds fetch failed: %s", exc)
+                        sofa_odds, odds_status = None, "error"
+                    if odds_status != "ok":
+                        await _near_miss(
+                            i, event_id, tournament_name, home, away,
+                            minute, rate, gt, target_line, score,
+                            reason=(f"SofaScore Over {target_line} odds "
+                                    f"{odds_status} — can't verify EV"),
+                        )
+                        fired.add(i)
+                        continue
+                    if sofa_odds < floor:
+                        await _near_miss(
+                            i, event_id, tournament_name, home, away,
+                            minute, rate, gt, target_line, score,
+                            reason=(f"SofaScore Over {target_line} odds "
+                                    f"{sofa_odds:.2f} < floor {floor:.2f} "
+                                    f"(Exchange ≈ {sofa_odds*1.05:.2f})"),
+                        )
+                        fired.add(i)
+                        continue
                     await _push_alert_only(
                         event_id, tournament_name, home, away,
                         minute, rate, gt, target_line, score, wr,
-                        sofa_odds=sofa_odds, odds_status=odds_status,
+                        sofa_odds=sofa_odds, odds_status="ok",
                     )
                     fired.add(i)
                     continue
