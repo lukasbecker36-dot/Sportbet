@@ -682,7 +682,12 @@ async def _auto_discover_loop() -> None:
     lookahead_s = config.LIVE_AUTO_DISCOVER_LOOKAHEAD_H * 3600
     active_interval = config.LIVE_AUTO_DISCOVER_INTERVAL_S
     idle_interval = getattr(config, "LIVE_AUTO_DISCOVER_IDLE_INTERVAL_S", 600)
-    target_leagues = set(getattr(config, "LIVE_STRATEGY_BY_LEAGUE", {}).keys())
+    # Read from LIVE_STRATEGIES_BY_LEAGUE (plural) — the source of truth.
+    # The legacy singular LIVE_STRATEGY_BY_LEAGUE is back-compat only and may
+    # lag behind when new leagues are added.
+    target_leagues = set(getattr(config, "LIVE_STRATEGIES_BY_LEAGUE", {}).keys())
+    if not target_leagues:
+        target_leagues = set(getattr(config, "LIVE_STRATEGY_BY_LEAGUE", {}).keys())
     if not target_leagues:
         logger.warning("auto-discover: no leagues mapped; loop will idle")
     handle = STATE.bot_handle
@@ -856,7 +861,8 @@ async def _amain() -> None:
         asyncio.create_task(_auto_discover_loop())
         logger.info(
             "Auto-discover ON: scanning %s leagues every %ds (lookahead %dh)",
-            len(getattr(config, "LIVE_STRATEGY_BY_LEAGUE", {})),
+            len(getattr(config, "LIVE_STRATEGIES_BY_LEAGUE", {})
+                or getattr(config, "LIVE_STRATEGY_BY_LEAGUE", {})),
             config.LIVE_AUTO_DISCOVER_INTERVAL_S,
             config.LIVE_AUTO_DISCOVER_LOOKAHEAD_H,
         )
@@ -878,9 +884,11 @@ async def _amain() -> None:
             f"stake £{config.LIVE_STAKE_GBP:.0f}, EV floor {config.LIVE_MIN_EV:+.2f}, "
             f"daily cap £{config.LIVE_DAILY_STAKE_CAP_GBP:.0f}"
         )
+    n_leagues = len(getattr(config, "LIVE_STRATEGIES_BY_LEAGUE", {})
+                    or getattr(config, "LIVE_STRATEGY_BY_LEAGUE", {}))
     await handle.send_text(
         f"🟢 Live monitor online. Auto-discover: <b>{auto}</b>\n"
-        f"leagues: {len(getattr(config, 'LIVE_STRATEGY_BY_LEAGUE', {}))}  "
+        f"leagues: {n_leagues}  "
         + intro_tail,
     )
 
