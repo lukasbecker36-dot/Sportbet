@@ -43,6 +43,7 @@ from live.betfair_client import (
     BetfairLive, OverGoalsMarket, PriceSnapshot,
     PlacementResult, adjusted_odds, expected_value,
 )
+from live.odds_lookup import load_lookup, short_for_tournament
 from live.monitor import (
     DEFAULT_MAX_MIN, DEFAULT_MIN_MIN, DEFAULT_THRESHOLD,
     Shot, _candidate_alert, _fmt_score, _match_minute,
@@ -82,8 +83,10 @@ async def _push_alert_only(
     minute: int, rate: float, goals: int, line: float, score: str,
     win_rate: float,
     *,
-    sofa_odds: float | None = None,
-    odds_status: str = "skip",
+    expected_odds: float | None = None,
+    expected_n: int = 0,
+    floor: float | None = None,
+    sweet_spot: str | None = None,
 ) -> None:
     """Alert-only fire path: skips Betfair entirely.
 
@@ -119,27 +122,33 @@ async def _push_alert_only(
     )
     if handle is None:
         return
-    # Build an odds line — show SofaScore price + estimated Exchange odds
-    # (~5% higher, accounting for bookmaker overround). If the gate didn't
-    # find a usable price, say so explicitly.
-    if sofa_odds is not None and odds_status == "ok":
-        exch_est = sofa_odds * 1.05
-        odds_line = (f"SofaScore Over {line} = <b>{sofa_odds:.2f}</b>  "
-                     f"(Exchange ≈ {exch_est:.2f})")
-    elif odds_status == "suspended":
-        odds_line = "<i>SofaScore market suspended — check Exchange before backing</i>"
-    elif odds_status in ("missing", "error"):
-        odds_line = f"<i>SofaScore over_{line} odds unavailable</i>"
-    else:
-        odds_line = ""
+    # Sense-check info derived from historical Betfair data:
+    #   - expected_odds: median Betfair LTP at this (league, line, score,
+    #     minute) state from the synthetic-odds lookup.
+    #   - floor: per-league break-even (skip if Exchange < this).
+    #   - sweet_spot: the bucket where conditional EV is strongest.
+    info_lines = []
+    if expected_odds is not None:
+        info_lines.append(
+            f"expected Betfair ≈ <b>{expected_odds:.2f}</b> "
+            f"(median of n={expected_n} historical fires at this state)"
+        )
+    if floor is not None and sweet_spot is not None:
+        info_lines.append(
+            f"break-even <b>{floor:.2f}</b>  |  sweet spot <b>{sweet_spot}</b>"
+        )
+        info_lines.append(
+            f"⚠ <i>skip if Betfair LTP &lt; {floor:.2f}</i>"
+        )
+    info_block = ("\n" + "\n".join(info_lines)) if info_lines else ""
     try:
         await handle.send_signal(
             f"⚡ <b>SIGNAL — {home} v {away}</b>\n"
             f"min <b>{minute}'</b>  score <b>{score}</b>  G={goals}\n"
             f"xg_rate_15m=<b>{rate:.2f}</b>  win_rate=<b>{win_rate:.0%}</b>\n"
-            f"<b>BACK Over {line} Goals</b> on Betfair (manual)\n"
-            + (odds_line + "\n" if odds_line else "")
-            + f"<i>(alert-only mode — est. odds ≈{est_odds:.2f} used for paper P&amp;L)</i>",
+            f"<b>BACK Over {line} Goals</b> on Betfair (manual)"
+            + info_block
+            + f"\n<i>(alert-only mode — paper P&amp;L uses est. ≈{est_odds:.2f})</i>",
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("alert-only telegram send failed: %s", exc)
@@ -480,55 +489,50 @@ async def _monitor_match(event_id: int) -> None:
                 # estimated odds derived from the strategy's win_rate so /pnl
                 # still tracks meaningful numbers.
                 if alert_only:
-                    # SofaScore odds gate — alert-only mode has no Betfair
-                    # Betting API access, so we use SofaScore's live
-                    # bookmaker odds (5% lower than Exchange) as a
-                    # conservative gate. Strict policy: only push an alert
-                    # when odds are confirmed above the league's floor.
-                    # Anything else (below floor, suspended mid-goal,
-                    # missing, fetch error) becomes a silent near-miss.
+                    # Synthetic-Betfair-odds gate. SofaScore live odds turned
+                    # out to be too stale for in-play gating (bookmaker
+                    # quotes lag the Exchange by minutes). Instead we look
+                    # up the historical median Betfair LTP at this
+                    # (league, line, score, minute) state from our priced
+                    # backtest data. If that median is below the league's
+                    # break-even floor, the alert is downgraded to a silent
+                    # near-miss. Otherwise we fire with the expected odds +
+                    # floor + sweet-spot info embedded so you can
+                    # sense-check before backing on Betfair manually.
+                    league_short = short_for_tournament(tournament_id)
                     floor = (getattr(config,
-                                     "LIVE_SOFASCORE_ODDS_FLOOR_BY_LEAGUE",
+                                     "LIVE_BETFAIR_ODDS_FLOOR_BY_LEAGUE",
                                      {}) or {}).get(tournament_id)
-                    if floor is None:
-                        # No floor configured for this league — fall back to
-                        # firing without the gate (back-compat behaviour).
-                        await _push_alert_only(
-                            event_id, tournament_name, home, away,
-                            minute, rate, gt, target_line, score, wr,
-                        )
-                        fired.add(i)
-                        continue
-                    try:
-                        sofa_odds, odds_status = await asyncio.to_thread(
-                            sofa.overunder_odds, event_id, target_line,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("sofa odds fetch failed: %s", exc)
-                        sofa_odds, odds_status = None, "error"
-                    if odds_status != "ok":
+                    sweet = (getattr(config,
+                                     "LIVE_BETFAIR_SWEET_SPOT_BY_LEAGUE",
+                                     {}) or {}).get(tournament_id)
+                    expected_odds = None
+                    expected_n = 0
+                    if league_short is not None:
+                        try:
+                            lk = load_lookup()
+                            expected_odds, expected_n = lk.median(
+                                league_short, float(target_line), gt, minute,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "odds lookup failed: %s", exc,
+                            )
+                    if floor is not None and expected_odds is not None and expected_odds < floor:
                         await _near_miss(
                             i, event_id, tournament_name, home, away,
                             minute, rate, gt, target_line, score,
-                            reason=(f"SofaScore Over {target_line} odds "
-                                    f"{odds_status} — can't verify EV"),
-                        )
-                        fired.add(i)
-                        continue
-                    if sofa_odds < floor:
-                        await _near_miss(
-                            i, event_id, tournament_name, home, away,
-                            minute, rate, gt, target_line, score,
-                            reason=(f"SofaScore Over {target_line} odds "
-                                    f"{sofa_odds:.2f} < floor {floor:.2f} "
-                                    f"(Exchange ≈ {sofa_odds*1.05:.2f})"),
+                            reason=(f"expected Betfair ≈ {expected_odds:.2f} "
+                                    f"< floor {floor:.2f} "
+                                    f"(n={expected_n} historical, sub-break-even)"),
                         )
                         fired.add(i)
                         continue
                     await _push_alert_only(
                         event_id, tournament_name, home, away,
                         minute, rate, gt, target_line, score, wr,
-                        sofa_odds=sofa_odds, odds_status="ok",
+                        expected_odds=expected_odds, expected_n=expected_n,
+                        floor=floor, sweet_spot=sweet,
                     )
                     fired.add(i)
                     continue
