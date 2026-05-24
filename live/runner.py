@@ -299,6 +299,13 @@ async def _monitor_match(event_id: int) -> None:
     # Track per-strategy firing — each strategy fires at most once per match,
     # but multiple strategies CAN fire on the same fixture (no dedup).
     fired: set[int] = set()
+    # Per-strategy "was xg_rate >= threshold on last poll" — enables
+    # rising-edge detection so we only fire on actual crossings, not on
+    # any tick where the condition happens to be true. This aligns live
+    # firing with the backtest's crossing-event model. Critical for the
+    # "post-goal artifact" case where prior xG buildup is still in the
+    # 15-min window after a goal flips goals_total into the line's floor.
+    prev_above_thr: dict[int, bool] = {}
     home = away = "?"
     strategies: list[tuple] = []
     kickoff_card_sent = False
@@ -473,11 +480,24 @@ async def _monitor_match(event_id: int) -> None:
             # minutes, so the exposure is on separate Betfair markets).
             alert_only = bool(getattr(config, "LIVE_ALERT_ONLY_MODE", False))
             for i, (thr, kind, val, mn, mx, wr) in enumerate(strategies):
+                # Rising-edge tracker — must be updated for EVERY poll (in
+                # or out of window, fired or not) so we correctly detect
+                # the moment xg_rate transitions across the threshold.
+                is_above = rate >= thr
+                was_above = prev_above_thr.get(i, False)
+                just_crossed = is_above and not was_above
+                prev_above_thr[i] = is_above
+
                 if i in fired:
                     continue
-                if minute < mn or minute > mx:
+                # Only fire on the rising-edge crossing. This matches the
+                # backtest's signal-detection model and prevents the
+                # post-goal artifact (where xG from before a goal is still
+                # in the 15-min window after the goal flips goals_total
+                # into the line's floor, causing a stale fire).
+                if not just_crossed:
                     continue
-                if rate < thr:
+                if minute < mn or minute > mx:
                     continue
                 target_line = _resolve_line(kind, val, gt)
                 if target_line is None:
