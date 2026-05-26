@@ -44,6 +44,7 @@ from live.betfair_client import (
     PlacementResult, adjusted_odds, expected_value,
 )
 from live.odds_lookup import load_lookup, short_for_tournament
+from live.pinnacle import Pinnacle
 from live.monitor import (
     DEFAULT_MAX_MIN, DEFAULT_MIN_MIN, DEFAULT_THRESHOLD,
     Shot, _candidate_alert, _fmt_score, _match_minute,
@@ -64,6 +65,9 @@ class RunnerState:
         self.bf: Optional[BetfairLive] = None
         self.bot_handle: Optional[tg.BotHandle] = None
         self.app: Optional[Application] = None
+        # Pinnacle live-odds client (proxied through Webshare). Lazy-init
+        # on startup; None means no live odds, fall back to synthetic gate.
+        self.pinnacle = None
         # event_id -> {task, label, last_tick, strategy}
         self.monitors: dict[int, dict] = {}
         self.daily_staked: float = 0.0
@@ -84,7 +88,7 @@ async def _push_alert_only(
     win_rate: float,
     *,
     expected_odds: float | None = None,
-    expected_n: int = 0,
+    expected_source: str | None = None,
     floor: float | None = None,
     sweet_spot: str | None = None,
 ) -> None:
@@ -122,17 +126,14 @@ async def _push_alert_only(
     )
     if handle is None:
         return
-    # Sense-check info derived from historical Betfair data:
-    #   - expected_odds: median Betfair LTP at this (league, line, score,
-    #     minute) state from the synthetic-odds lookup.
-    #   - floor: per-league break-even (skip if Exchange < this).
-    #   - sweet_spot: the bucket where conditional EV is strongest.
+    # Sense-check info: live Pinnacle price if available, otherwise the
+    # historical synthetic median. Plus the league's break-even floor and
+    # sweet-spot bracket so the user has a reference before checking
+    # Betfair manually.
     info_lines = []
     if expected_odds is not None:
-        info_lines.append(
-            f"expected Betfair ≈ <b>{expected_odds:.2f}</b> "
-            f"(median of n={expected_n} historical fires at this state)"
-        )
+        src = expected_source or "expected"
+        info_lines.append(f"{src}: <b>{expected_odds:.2f}</b>")
     if floor is not None and sweet_spot is not None:
         info_lines.append(
             f"break-even <b>{floor:.2f}</b>  |  sweet spot <b>{sweet_spot}</b>"
@@ -509,49 +510,73 @@ async def _monitor_match(event_id: int) -> None:
                 # estimated odds derived from the strategy's win_rate so /pnl
                 # still tracks meaningful numbers.
                 if alert_only:
-                    # Synthetic-Betfair-odds gate. SofaScore live odds turned
-                    # out to be too stale for in-play gating (bookmaker
-                    # quotes lag the Exchange by minutes). Instead we look
-                    # up the historical median Betfair LTP at this
-                    # (league, line, score, minute) state from our priced
-                    # backtest data. If that median is below the league's
-                    # break-even floor, the alert is downgraded to a silent
-                    # near-miss. Otherwise we fire with the expected odds +
-                    # floor + sweet-spot info embedded so you can
-                    # sense-check before backing on Betfair manually.
-                    league_short = short_for_tournament(tournament_id)
+                    # Live-odds gate: try Pinnacle first (sharp live in-play
+                    # prices via Webshare proxy), fall back to historical
+                    # synthetic-odds median if Pinnacle can't be reached or
+                    # doesn't have a matchup / line we can read.
                     floor = (getattr(config,
                                      "LIVE_BETFAIR_ODDS_FLOOR_BY_LEAGUE",
                                      {}) or {}).get(tournament_id)
                     sweet = (getattr(config,
                                      "LIVE_BETFAIR_SWEET_SPOT_BY_LEAGUE",
                                      {}) or {}).get(tournament_id)
-                    expected_odds = None
-                    expected_n = 0
-                    if league_short is not None:
+
+                    actual_odds: float | None = None
+                    odds_source: str | None = None
+
+                    # --- 1) Pinnacle (live) ---
+                    if STATE.pinnacle is not None:
                         try:
-                            lk = load_lookup()
-                            expected_odds, expected_n = lk.median(
-                                league_short, float(target_line), gt, minute,
+                            pmid = await asyncio.to_thread(
+                                STATE.pinnacle.find_match,
+                                tournament_id, home, away,
                             )
+                            if pmid:
+                                pin_price = await asyncio.to_thread(
+                                    STATE.pinnacle.over_odds,
+                                    pmid, float(target_line),
+                                )
+                                if pin_price is not None:
+                                    actual_odds = pin_price
+                                    odds_source = "Pinnacle live"
                         except Exception as exc:  # noqa: BLE001
-                            logger.warning(
-                                "odds lookup failed: %s", exc,
-                            )
-                    if floor is not None and expected_odds is not None and expected_odds < floor:
+                            logger.warning("Pinnacle live fetch failed: %s", exc)
+
+                    # --- 2) Synthetic fallback ---
+                    if actual_odds is None:
+                        league_short = short_for_tournament(tournament_id)
+                        if league_short is not None:
+                            try:
+                                lk = load_lookup()
+                                synth_odds, synth_n = lk.median(
+                                    league_short, float(target_line), gt, minute,
+                                )
+                                if synth_odds is not None:
+                                    actual_odds = synth_odds
+                                    odds_source = (
+                                        f"historical median (n={synth_n})"
+                                    )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("odds lookup failed: %s", exc)
+
+                    # --- Gate ---
+                    if (floor is not None and actual_odds is not None
+                            and actual_odds < floor):
                         await _near_miss(
                             i, event_id, tournament_name, home, away,
                             minute, rate, gt, target_line, score,
-                            reason=(f"expected Betfair ≈ {expected_odds:.2f} "
-                                    f"< floor {floor:.2f} "
-                                    f"(n={expected_n} historical, sub-break-even)"),
+                            reason=(f"{odds_source or 'odds'}: "
+                                    f"{actual_odds:.2f} < floor {floor:.2f} "
+                                    f"(sub-break-even)"),
                         )
                         fired.add(i)
                         continue
+
                     await _push_alert_only(
                         event_id, tournament_name, home, away,
                         minute, rate, gt, target_line, score, wr,
-                        expected_odds=expected_odds, expected_n=expected_n,
+                        expected_odds=actual_odds,
+                        expected_source=odds_source,
                         floor=floor, sweet_spot=sweet,
                     )
                     fired.add(i)
@@ -943,6 +968,16 @@ async def _amain() -> None:
             await asyncio.sleep(5)
 
     asyncio.create_task(_refresh_status_loop())
+
+    # Initialise Pinnacle live-odds client. Proxied via Webshare (Pinnacle
+    # blocks datacenter IPs directly). If init fails for any reason, leave
+    # STATE.pinnacle as None and the gate falls back to synthetic-odds.
+    try:
+        STATE.pinnacle = Pinnacle()
+        logger.info("Pinnacle live-odds client initialised (proxied)")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Pinnacle init failed; using synthetic-odds only: %s", e)
+        STATE.pinnacle = None
 
     if getattr(config, "LIVE_AUTO_DISCOVER", False):
         asyncio.create_task(_auto_discover_loop())
